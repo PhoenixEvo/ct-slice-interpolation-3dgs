@@ -73,6 +73,13 @@ desktop.ini
 # Colab
 .drive/
 
+# Project-specific: keep local, hide on remote
+instruction.md
+GITHUB_SETUP.md
+PUSH_TO_GITHUB.md
+setup_github.ps1
+notebooks/
+
 # Results and figures (optional - uncomment if you don't want to commit)
 # results/
 # figures/
