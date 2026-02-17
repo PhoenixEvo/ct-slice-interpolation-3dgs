@@ -1,0 +1,79 @@
+# ============================================================
+# Default configuration for CT Slice Interpolation via 3DGS
+# ============================================================
+
+# --- Data ---
+data:
+  dataset_root: "/content/drive/MyDrive/TLCN/PKG-CT-ORG/CT-ORG/OrganSegmentations"
+  output_root: "/content/drive/MyDrive/TLCN/outputs"
+  hu_min: -1000
+  hu_max: 1000
+  normalize_range: [0.0, 1.0]
+  # Patient split indices
+  test_cases: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  val_cases: [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+  # train_cases: 42-139 (auto-computed)
+  sparse_ratios: [2, 3]
+
+# --- Classical baselines ---
+classical:
+  methods: ["nearest", "linear", "cubic"]
+
+# --- U-Net 2D baseline ---
+unet:
+  in_channels: 2
+  out_channels: 1
+  features: [32, 64, 128, 256]
+  lr: 1.0e-4
+  batch_size: 8
+  num_epochs: 50
+  scheduler_step: 20
+  scheduler_gamma: 0.5
+
+# --- 3DGS model ---
+gaussian:
+  # Initialization
+  subsample_xy: 4          # Subsample factor in x,y for grid init
+  init_scale_xy: 2.0       # Initial scale in x,y (pixels)
+  init_scale_z: 1.0        # Initial scale in z (slices)
+  init_opacity: 0.8        # Initial opacity (before sigmoid)
+
+  # Optimization
+  lr_position: 0.01
+  lr_scale: 0.005
+  lr_opacity: 0.01
+  lr_intensity: 0.01
+  num_iterations: 2000
+  warmup_iterations: 200
+
+  # Densification & pruning
+  densify_interval: 100
+  densify_grad_threshold: 0.0005
+  prune_opacity_threshold: 0.01
+  max_gaussians: 500000
+
+  # Rendering
+  tile_size: 16
+  z_threshold: 3.0         # Only render Gaussians within 3*sigma_z of target
+
+# --- Losses ---
+loss:
+  lambda_smooth: 0.01
+  lambda_edge: 0.005
+
+# --- Evaluation ---
+eval:
+  organ_labels:
+    liver: 1
+    bladder: 2
+    lungs: 3
+    kidneys: 4
+    bone: 5
+
+# --- Training ---
+training:
+  seed: 42
+  mixed_precision: true
+  checkpoint_interval: 500
+  log_interval: 50
+  num_workers: 2
