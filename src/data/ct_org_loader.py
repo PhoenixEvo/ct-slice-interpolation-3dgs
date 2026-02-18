@@ -45,12 +45,19 @@ class CTORGLoader:
             Sorted list of case indices found in the dataset.
         """
         cases = []
-        for f in self.dataset_root.glob("volume-*.nii.gz"):
-            try:
-                idx = int(f.stem.replace("volume-", "").replace(".nii", ""))
-                cases.append(idx)
-            except ValueError:
-                continue
+        # Try both .nii.gz and .nii (Kaggle auto-extracts .gz files)
+        for pattern in ["volume-*.nii.gz", "volume-*.nii"]:
+            for f in self.dataset_root.glob(pattern):
+                try:
+                    # Handle both .nii.gz and .nii
+                    stem = f.stem
+                    if stem.endswith(".nii"):
+                        stem = stem[:-4]  # Remove .nii
+                    idx = int(stem.replace("volume-", ""))
+                    if idx not in cases:
+                        cases.append(idx)
+                except ValueError:
+                    continue
         return sorted(cases)
 
     def load_volume(self, case_idx: int) -> Tuple[np.ndarray, Dict]:
@@ -63,9 +70,14 @@ class CTORGLoader:
             Tuple of (volume_array, metadata_dict).
             volume_array shape: (H, W, D) in float32.
         """
+        # Try .nii.gz first, then fallback to .nii (Kaggle auto-extracts)
         volume_path = self.dataset_root / f"volume-{case_idx}.nii.gz"
         if not volume_path.exists():
-            raise FileNotFoundError(f"Volume not found: {volume_path}")
+            volume_path = self.dataset_root / f"volume-{case_idx}.nii"
+        if not volume_path.exists():
+            raise FileNotFoundError(
+                f"Volume not found: volume-{case_idx}.nii.gz or volume-{case_idx}.nii"
+            )
 
         nii = nib.load(str(volume_path))
         volume = nii.get_fdata().astype(np.float32)
@@ -89,7 +101,10 @@ class CTORGLoader:
         Returns:
             Label array (H, W, D) in int, or None if not found.
         """
+        # Try .nii.gz first, then fallback to .nii (Kaggle auto-extracts)
         label_path = self.dataset_root / f"labels-{case_idx}.nii.gz"
+        if not label_path.exists():
+            label_path = self.dataset_root / f"labels-{case_idx}.nii"
         if not label_path.exists():
             return None
 
@@ -146,9 +161,14 @@ class CTORGLoader:
         Returns:
             Dictionary with volume metadata.
         """
+        # Try .nii.gz first, then fallback to .nii (Kaggle auto-extracts)
         volume_path = self.dataset_root / f"volume-{case_idx}.nii.gz"
         if not volume_path.exists():
-            raise FileNotFoundError(f"Volume not found: {volume_path}")
+            volume_path = self.dataset_root / f"volume-{case_idx}.nii"
+        if not volume_path.exists():
+            raise FileNotFoundError(
+                f"Volume not found: volume-{case_idx}.nii.gz or volume-{case_idx}.nii"
+            )
 
         nii = nib.load(str(volume_path))
         header = nii.header
