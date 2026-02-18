@@ -44,21 +44,83 @@ class CTORGLoader:
         Returns:
             Sorted list of case indices found in the dataset.
         """
-        cases = []
-        # Try both .nii.gz and .nii (Kaggle auto-extracts .gz files)
+        cases: List[int] = []
         for pattern in ["volume-*.nii.gz", "volume-*.nii"]:
-            for f in self.dataset_root.glob(pattern):
+            for f in self.dataset_root.rglob(pattern):
+                # Only count actual files (Kaggle may create folders like volume-17.nii/)
+                if not f.is_file():
+                    continue
                 try:
-                    # Handle both .nii.gz and .nii
-                    stem = f.stem
-                    if stem.endswith(".nii"):
-                        stem = stem[:-4]  # Remove .nii
-                    idx = int(stem.replace("volume-", ""))
+                    name = f.name
+                    if name.endswith(".nii.gz"):
+                        core = name[:-7]
+                    elif name.endswith(".nii"):
+                        core = name[:-4]
+                    else:
+                        continue
+                    idx = int(core.replace("volume-", ""))
                     if idx not in cases:
                         cases.append(idx)
                 except ValueError:
                     continue
         return sorted(cases)
+
+    def _resolve_case_path(self, prefix: str, case_idx: int) -> Optional[Path]:
+        """Resolve a NIfTI path for a given case.
+
+        This is robust to Kaggle's extraction behavior where:
+        - `.nii.gz` may become `.nii`
+        - extra folders may be created and files placed inside unexpected directories
+
+        Args:
+            prefix: "volume" or "labels"
+            case_idx: Case index
+
+        Returns:
+            Path to an existing file, or None if not found.
+        """
+        # Prefer flat layout first
+        candidates = [
+            self.dataset_root / f"{prefix}-{case_idx}.nii.gz",
+            self.dataset_root / f"{prefix}-{case_idx}.nii",
+        ]
+        for p in candidates:
+            if p.exists() and p.is_file():
+                return p
+
+        # Recursively search for files by name
+        file_matches: List[Path] = []
+        for pat in [f"{prefix}-{case_idx}.nii.gz", f"{prefix}-{case_idx}.nii"]:
+            for p in self.dataset_root.rglob(pat):
+                if p.exists() and p.is_file():
+                    file_matches.append(p)
+
+        if file_matches:
+            # Pick the closest match to dataset_root (stable + avoids deep weird paths)
+            file_matches = sorted(file_matches, key=lambda x: (len(x.parts), str(x)))
+            return file_matches[0]
+
+        # Some Kaggle extractions create a directory named like the file (e.g., volume-17.nii/)
+        # In that case, search for directories and then look for the file inside.
+        dir_matches: List[Path] = []
+        for pat in [f"{prefix}-{case_idx}.nii", f"{prefix}-{case_idx}.nii.gz"]:
+            for p in self.dataset_root.rglob(pat):
+                if p.exists() and p.is_dir():
+                    dir_matches.append(p)
+
+        if dir_matches:
+            dir_matches = sorted(dir_matches, key=lambda x: (len(x.parts), str(x)))
+            for d in dir_matches:
+                inside = d / d.name
+                if inside.exists() and inside.is_file():
+                    return inside
+                # Also try the expected names inside this dir
+                for inside_name in [f"{prefix}-{case_idx}.nii", f"{prefix}-{case_idx}.nii.gz"]:
+                    inside2 = d / inside_name
+                    if inside2.exists() and inside2.is_file():
+                        return inside2
+
+        return None
 
     def load_volume(self, case_idx: int) -> Tuple[np.ndarray, Dict]:
         """Load a CT volume and return with metadata.
@@ -70,13 +132,10 @@ class CTORGLoader:
             Tuple of (volume_array, metadata_dict).
             volume_array shape: (H, W, D) in float32.
         """
-        # Try .nii.gz first, then fallback to .nii (Kaggle auto-extracts)
-        volume_path = self.dataset_root / f"volume-{case_idx}.nii.gz"
-        if not volume_path.exists():
-            volume_path = self.dataset_root / f"volume-{case_idx}.nii"
-        if not volume_path.exists():
+        volume_path = self._resolve_case_path("volume", case_idx)
+        if volume_path is None:
             raise FileNotFoundError(
-                f"Volume not found: volume-{case_idx}.nii.gz or volume-{case_idx}.nii"
+                f"Volume not found for case {case_idx} (.nii.gz or .nii)"
             )
 
         nii = nib.load(str(volume_path))
@@ -101,11 +160,8 @@ class CTORGLoader:
         Returns:
             Label array (H, W, D) in int, or None if not found.
         """
-        # Try .nii.gz first, then fallback to .nii (Kaggle auto-extracts)
-        label_path = self.dataset_root / f"labels-{case_idx}.nii.gz"
-        if not label_path.exists():
-            label_path = self.dataset_root / f"labels-{case_idx}.nii"
-        if not label_path.exists():
+        label_path = self._resolve_case_path("labels", case_idx)
+        if label_path is None:
             return None
 
         nii = nib.load(str(label_path))
@@ -161,13 +217,10 @@ class CTORGLoader:
         Returns:
             Dictionary with volume metadata.
         """
-        # Try .nii.gz first, then fallback to .nii (Kaggle auto-extracts)
-        volume_path = self.dataset_root / f"volume-{case_idx}.nii.gz"
-        if not volume_path.exists():
-            volume_path = self.dataset_root / f"volume-{case_idx}.nii"
-        if not volume_path.exists():
+        volume_path = self._resolve_case_path("volume", case_idx)
+        if volume_path is None:
             raise FileNotFoundError(
-                f"Volume not found: volume-{case_idx}.nii.gz or volume-{case_idx}.nii"
+                f"Volume not found for case {case_idx} (.nii.gz or .nii)"
             )
 
         nii = nib.load(str(volume_path))
@@ -186,7 +239,7 @@ class CTORGLoader:
         test_cases: List[int],
         val_cases: List[int],
     ) -> Dict[str, List[int]]:
-        """Split cases into train/val/test sets.
+        """Split cases into train/val/test sets.1
 
         Args:
             available_cases: All available case indices.
