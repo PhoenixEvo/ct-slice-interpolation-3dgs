@@ -136,3 +136,79 @@ class ClassicalInterpolator:
                 observed_slices, observed_indices, target_indices
             )
         return results
+
+    @staticmethod
+    def interpolate_target_slice(
+        volume: np.ndarray,
+        observed_indices: np.ndarray,
+        target_z: int,
+        method: str,
+    ) -> np.ndarray:
+        """Interpolate a single target slice directly from the volume.
+
+        Memory-efficient: only reads needed slices from the volume without
+        creating large intermediate arrays. Peak usage = 4 slices max.
+
+        Args:
+            volume: Full CT volume (H, W, D).
+            observed_indices: Sorted array of observed z-indices.
+            target_z: Z-index of the slice to interpolate.
+            method: 'nearest', 'linear', or 'cubic'.
+
+        Returns:
+            Interpolated slice (H, W) as float32.
+        """
+        obs = np.asarray(observed_indices)
+
+        if method == "nearest":
+            nearest_z = obs[np.argmin(np.abs(obs - target_z))]
+            return volume[:, :, nearest_z].copy()
+
+        # Find bracketing observed slices
+        left_mask = obs <= target_z
+        right_mask = obs >= target_z
+
+        if not left_mask.any() or not right_mask.any():
+            nearest_z = obs[np.argmin(np.abs(obs - target_z))]
+            return volume[:, :, nearest_z].copy()
+
+        z1 = obs[left_mask][-1]
+        z2 = obs[right_mask][0]
+
+        if z1 == z2:
+            return volume[:, :, z1].copy()
+
+        alpha = (target_z - z1) / (z2 - z1)
+
+        if method == "linear":
+            result = np.empty_like(volume[:, :, 0])
+            np.multiply(volume[:, :, z1], 1 - alpha, out=result)
+            result += alpha * volume[:, :, z2]
+            return result
+
+        # Cubic: Catmull-Rom with 4 control points
+        z0_cands = obs[obs < z1]
+        z3_cands = obs[obs > z2]
+        if len(z0_cands) == 0 or len(z3_cands) == 0:
+            result = np.empty_like(volume[:, :, 0])
+            np.multiply(volume[:, :, z1], 1 - alpha, out=result)
+            result += alpha * volume[:, :, z2]
+            return result
+
+        z0 = z0_cands[-1]
+        z3 = z3_cands[0]
+        t = alpha
+        t2 = t * t
+        t3 = t2 * t
+        w0 = -0.5 * t3 + t2 - 0.5 * t
+        w1 = 1.5 * t3 - 2.5 * t2 + 1.0
+        w2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t
+        w3 = 0.5 * t3 - 0.5 * t2
+
+        result = (
+            w0 * volume[:, :, z0]
+            + w1 * volume[:, :, z1]
+            + w2 * volume[:, :, z2]
+            + w3 * volume[:, :, z3]
+        )
+        return result.astype(np.float32)

@@ -407,10 +407,10 @@ class Trainer3DGS:
                     params["intensity"],
                     float(self.target_indices[i]),
                 )
-                batch_rendered.append(torch.clamp(rendered, 0.0, 1.0))
+                batch_rendered.append(torch.clamp(rendered.squeeze(0), 0.0, 1.0))
 
-            stacked = torch.cat(batch_rendered, dim=0)
-            results[:, :, start:end] = stacked.squeeze(1).cpu().numpy().transpose(1, 2, 0)
+            stacked = torch.stack(batch_rendered, dim=0).cpu().numpy()
+            results[:, :, start:end] = stacked.transpose(1, 2, 0)
 
         return results
 

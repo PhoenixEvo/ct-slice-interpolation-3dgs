@@ -224,12 +224,18 @@ class TrainerUNet:
 
         return pred.squeeze(0).cpu().float()
 
+    def _unwrap_model(self) -> nn.Module:
+        """Get the underlying model, unwrapping DataParallel if needed."""
+        if isinstance(self.model, nn.DataParallel):
+            return self.model.module
+        return self.model
+
     def _save_checkpoint(self, filename: str, epoch: int) -> None:
-        """Save model checkpoint."""
+        """Save model checkpoint (always saves unwrapped state_dict)."""
         path = self.checkpoint_dir / filename
         torch.save({
             "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": self._unwrap_model().state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "history": self.history,
@@ -239,7 +245,7 @@ class TrainerUNet:
         """Load model checkpoint."""
         path = self.checkpoint_dir / filename
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self._unwrap_model().load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if "history" in checkpoint:

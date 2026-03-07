@@ -169,23 +169,24 @@ class CTORGLoader:
         return labels
 
     def preprocess_volume(self, volume: np.ndarray) -> np.ndarray:
-        """Apply HU clipping and normalization.
+        """Apply HU clipping and normalization in-place to minimize copies.
 
         Args:
-            volume: Raw CT volume in HU.
+            volume: Raw CT volume in HU (modified in-place if float32).
 
         Returns:
             Normalized volume in target range.
         """
-        # Clip HU values
-        volume = np.clip(volume, self.hu_min, self.hu_max)
-
-        # Normalize to target range
+        if volume.dtype != np.float32:
+            volume = volume.astype(np.float32)
+        np.clip(volume, self.hu_min, self.hu_max, out=volume)
         lo, hi = self.normalize_range
-        volume = (volume - self.hu_min) / (self.hu_max - self.hu_min)
-        volume = volume * (hi - lo) + lo
-
-        return volume.astype(np.float32)
+        volume -= self.hu_min
+        volume /= (self.hu_max - self.hu_min)
+        if lo != 0.0 or hi != 1.0:
+            volume *= (hi - lo)
+            volume += lo
+        return volume
 
     def load_and_preprocess(
         self, case_idx: int
