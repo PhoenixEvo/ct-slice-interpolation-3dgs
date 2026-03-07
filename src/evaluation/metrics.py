@@ -159,6 +159,19 @@ def _compute_bbox_ssim(
     return compute_ssim(pred_crop, gt_crop, data_range)
 
 
+def compute_mae(prediction: np.ndarray, ground_truth: np.ndarray) -> float:
+    """Compute Mean Absolute Error.
+
+    Args:
+        prediction: Predicted image/slice.
+        ground_truth: Ground truth image/slice.
+
+    Returns:
+        MAE value.
+    """
+    return float(np.mean(np.abs(prediction - ground_truth)))
+
+
 def evaluate_slice(
     prediction: np.ndarray,
     ground_truth: np.ndarray,
@@ -181,6 +194,7 @@ def evaluate_slice(
     result = {
         "psnr": compute_psnr(prediction, ground_truth, data_range),
         "ssim": compute_ssim(prediction, ground_truth, data_range),
+        "mae": compute_mae(prediction, ground_truth),
     }
 
     if mask is not None:
@@ -230,12 +244,15 @@ def evaluate_volume(
     # Aggregate metrics
     psnr_values = [m["psnr"] for m in per_slice]
     ssim_values = [m["ssim"] for m in per_slice]
+    mae_values = [m.get("mae", 0.0) for m in per_slice]
 
     summary = {
         "mean_psnr": float(np.mean(psnr_values)),
         "std_psnr": float(np.std(psnr_values)),
         "mean_ssim": float(np.mean(ssim_values)),
         "std_ssim": float(np.std(ssim_values)),
+        "mean_mae": float(np.mean(mae_values)),
+        "std_mae": float(np.std(mae_values)),
         "num_slices": len(per_slice),
     }
 

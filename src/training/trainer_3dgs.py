@@ -57,17 +57,31 @@ class Trainer3DGS:
         gs_config = config.get("gaussian", {})
         loss_config = config.get("loss", {})
         train_config = config.get("training", {})
+        self._gs_config = gs_config
 
-        # Initialize Gaussian Volume
-        self.gaussian_model = GaussianVolume.from_volume_grid(
-            volume=volume,
-            observed_indices=observed_indices,
-            subsample_xy=gs_config.get("subsample_xy", 4),
-            init_scale_xy=gs_config.get("init_scale_xy", 2.0),
-            init_scale_z=gs_config.get("init_scale_z", 1.0),
-            init_opacity=gs_config.get("init_opacity", 0.8),
-            device=device,
-        )
+        # Initialize Gaussian Volume (support adaptive edge-aware init)
+        init_mode = gs_config.get("init_mode", "grid")
+        if init_mode == "adaptive":
+            self.gaussian_model = GaussianVolume.from_volume_adaptive(
+                volume=volume,
+                observed_indices=observed_indices,
+                subsample_xy=gs_config.get("subsample_xy", 4),
+                edge_boost=gs_config.get("edge_boost", 2.0),
+                init_scale_xy=gs_config.get("init_scale_xy", 2.0),
+                init_scale_z=gs_config.get("init_scale_z", 1.0),
+                init_opacity=gs_config.get("init_opacity", 0.8),
+                device=device,
+            )
+        else:
+            self.gaussian_model = GaussianVolume.from_volume_grid(
+                volume=volume,
+                observed_indices=observed_indices,
+                subsample_xy=gs_config.get("subsample_xy", 4),
+                init_scale_xy=gs_config.get("init_scale_xy", 2.0),
+                init_scale_z=gs_config.get("init_scale_z", 1.0),
+                init_opacity=gs_config.get("init_opacity", 0.8),
+                device=device,
+            )
 
         # Initialize Renderer
         self.renderer = SliceRenderer(
@@ -82,6 +96,8 @@ class Trainer3DGS:
         self.criterion = TotalLoss(
             lambda_smooth=loss_config.get("lambda_smooth", 0.01),
             lambda_edge=loss_config.get("lambda_edge", 0.005),
+            l1_weight=loss_config.get("l1_weight", 1.0),
+            ssim_weight=loss_config.get("ssim_weight", 0.1),
         ).to(device)
 
         # Training parameters
@@ -95,6 +111,15 @@ class Trainer3DGS:
             "prune_opacity_threshold", 0.01
         )
         self.max_gaussians = gs_config.get("max_gaussians", 500000)
+
+        # LR scheduling (exponential decay on position LR, standard in 3DGS)
+        self.lr_position_init = gs_config.get("lr_position", 0.01)
+        self.lr_position_final = gs_config.get("lr_position_final", 0.0001)
+        self.lr_decay_start = gs_config.get("lr_decay_start", 0)
+
+        # Opacity reset schedule
+        self.opacity_reset_interval = gs_config.get("opacity_reset_interval", 0)
+        self.opacity_reset_value = gs_config.get("opacity_reset_value", 0.5)
 
         # Mixed precision
         self.mixed_precision = train_config.get("mixed_precision", True)
@@ -122,7 +147,28 @@ class Trainer3DGS:
             "loss_edge": [],
             "num_gaussians": [],
             "psnr_train": [],
+            "lr_position": [],
         }
+
+    def _get_position_lr(self, iteration: int) -> float:
+        """Compute position learning rate with exponential decay."""
+        if self.lr_position_init == self.lr_position_final:
+            return self.lr_position_init
+        if iteration < self.lr_decay_start:
+            return self.lr_position_init
+        t = max(0, iteration - self.lr_decay_start)
+        total = max(1, self.num_iterations - self.lr_decay_start)
+        lr = self.lr_position_final * (
+            self.lr_position_init / self.lr_position_final
+        ) ** (1 - t / total)
+        return lr
+
+    def _update_learning_rate(self, iteration: int) -> None:
+        """Update position LR based on schedule."""
+        new_lr = self._get_position_lr(iteration)
+        for param_group in self.optimizer.param_groups:
+            if param_group.get("name") == "positions":
+                param_group["lr"] = new_lr
 
     def _setup_optimizer(self, gs_config: Dict) -> None:
         """Setup optimizer with per-parameter learning rates."""
@@ -196,6 +242,9 @@ class Trainer3DGS:
         obs_indices_list = list(self.observed_indices)
 
         for iteration in range(self.num_iterations):
+            # Update position LR schedule
+            self._update_learning_rate(iteration)
+
             self.optimizer.zero_grad()
 
             # Randomly sample an observed slice
@@ -250,6 +299,7 @@ class Trainer3DGS:
                     mse = ((rendered - gt_slice) ** 2).mean().item()
                     psnr = 10 * np.log10(1.0 / max(mse, 1e-10))
 
+                cur_lr = self._get_position_lr(iteration)
                 self.history["iteration"].append(iteration)
                 self.history["loss_total"].append(loss_dict["total"].item())
                 self.history["loss_rec"].append(
@@ -263,6 +313,7 @@ class Trainer3DGS:
                     self.gaussian_model.num_gaussians
                 )
                 self.history["psnr_train"].append(psnr)
+                self.history["lr_position"].append(cur_lr)
 
                 if iteration % (self.log_interval * 4) == 0:
                     elapsed = time.time() - t_start
@@ -272,6 +323,7 @@ class Trainer3DGS:
                         f"Rec: {loss_dict['reconstruction'].item():.6f} | "
                         f"PSNR: {psnr:.2f} dB | "
                         f"#GS: {self.gaussian_model.num_gaussians} | "
+                        f"LR_pos: {cur_lr:.6f} | "
                         f"Time: {elapsed:.1f}s"
                     )
 
@@ -286,7 +338,6 @@ class Trainer3DGS:
                     opacity_threshold=self.prune_opacity_threshold,
                     max_gaussians=self.max_gaussians,
                 )
-                # Rebuild optimizer with new parameters
                 self._rebuild_optimizer()
 
                 if stats["cloned"] > 0 or stats["pruned"] > 0:
@@ -297,6 +348,16 @@ class Trainer3DGS:
                         f"total: {stats['after']}"
                     )
 
+            # Periodic opacity reset to allow pruning stale Gaussians
+            if (
+                self.opacity_reset_interval > 0
+                and iteration > self.warmup_iterations
+                and iteration % self.opacity_reset_interval == 0
+                and iteration < self.num_iterations * 0.8
+            ):
+                self.gaussian_model.reset_opacity(self.opacity_reset_value)
+                print(f"  Opacity reset at iter {iteration}")
+
             # Checkpoint
             if (
                 iteration > 0
@@ -305,6 +366,7 @@ class Trainer3DGS:
                 self.save_checkpoint(f"iter_{iteration}.pt")
 
         total_time = time.time() - t_start
+        self.training_time = total_time
         print(
             f"Training complete in {total_time:.1f}s. "
             f"Final #Gaussians: {self.gaussian_model.num_gaussians}"
@@ -370,29 +432,47 @@ class Trainer3DGS:
         return volume
 
     @torch.no_grad()
-    def evaluate_on_targets(self) -> Dict:
+    def evaluate_on_targets(
+        self, organ_labels: Optional[Dict[str, int]] = None
+    ) -> Dict:
         """Evaluate interpolation quality on target slices.
+
+        Args:
+            organ_labels: Optional organ label mapping for ROI metrics.
 
         Returns:
             Dictionary with per-slice and aggregated metrics.
         """
         from ..evaluation.metrics import evaluate_volume
 
+        t_start = time.time()
         predictions = self.render_interpolated_slices()
+        inference_time = time.time() - t_start
 
-        # Get ground truth target slices
         gt_slices = np.zeros(
             (self.H, self.W, len(self.target_indices)), dtype=np.float32
         )
         for i, z_idx in enumerate(self.target_indices):
             gt_slices[:, :, i] = self.volume[:, :, z_idx]
 
-        return evaluate_volume(
+        result = evaluate_volume(
             predictions,
             gt_slices,
             self.target_indices,
             labels=self.labels,
+            organ_labels=organ_labels,
         )
+
+        result["summary"]["inference_time_s"] = inference_time
+        result["summary"]["training_time_s"] = getattr(
+            self, "training_time", 0.0
+        )
+        result["summary"]["num_gaussians_final"] = self.gaussian_model.num_gaussians
+        result["summary"]["mae"] = float(
+            np.mean(np.abs(predictions - gt_slices))
+        )
+
+        return result
 
     def save_checkpoint(self, filename: str) -> None:
         """Save training checkpoint.

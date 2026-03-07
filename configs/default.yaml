@@ -33,17 +33,21 @@ unet:
 # --- 3DGS model ---
 gaussian:
   # Initialization
+  init_mode: "grid"        # "grid" or "adaptive" (edge-aware)
   subsample_xy: 4          # Subsample factor in x,y for grid init
+  edge_boost: 2.0          # Density boost near edges (adaptive mode)
   init_scale_xy: 2.0       # Initial scale in x,y (pixels)
   init_scale_z: 1.0        # Initial scale in z (slices)
   init_opacity: 0.8        # Initial opacity (before sigmoid)
 
   # Optimization
   lr_position: 0.01
+  lr_position_final: 0.0001  # Final position LR (exponential decay)
+  lr_decay_start: 0          # Iteration to start LR decay
   lr_scale: 0.005
   lr_opacity: 0.01
   lr_intensity: 0.01
-  num_iterations: 2000
+  num_iterations: 3000       # Increased for better convergence
   warmup_iterations: 200
 
   # Densification & pruning
@@ -51,6 +55,8 @@ gaussian:
   densify_grad_threshold: 0.0005
   prune_opacity_threshold: 0.01
   max_gaussians: 500000
+  opacity_reset_interval: 500  # Reset opacity periodically (0=disabled)
+  opacity_reset_value: 0.5
 
   # Rendering
   tile_size: 16
@@ -58,6 +64,8 @@ gaussian:
 
 # --- Losses ---
 loss:
+  l1_weight: 1.0
+  ssim_weight: 0.1
   lambda_smooth: 0.01
   lambda_edge: 0.005
 
