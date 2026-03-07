@@ -79,7 +79,10 @@ GITHUB_SETUP.md
 PUSH_TO_GITHUB.md
 setup_github.ps1
 notebooks/
-
+kaggle_notebooks/
+BCTD.pptx
+i3NET.pdf
+MedGS.pdf
 # Results and figures (optional - uncomment if you don't want to commit)
 # results/
 # figures/
