@@ -5,6 +5,7 @@ PyTorch Dataset classes for slice interpolation experiments.
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
@@ -176,3 +177,92 @@ class UNetSliceDataset(Dataset):
             target_tensor = torch.flip(target_tensor, dims=[1])
 
         return input_tensor, target_tensor
+
+
+class LazyUNetSliceDataset(Dataset):
+    """Memory-efficient U-Net dataset that loads slices on demand from NIfTI.
+
+    Instead of holding all volumes in RAM, this dataset stores file paths
+    and loads only the needed slices when __getitem__ is called.
+    Suitable for Kaggle (16GB RAM) with large CT-ORG dataset.
+    """
+
+    def __init__(
+        self,
+        case_entries: List[Dict],
+        sparse_ratio: int = 2,
+        augment: bool = False,
+        hu_min: float = -1000.0,
+        hu_max: float = 1000.0,
+    ):
+        """Initialize lazy U-Net dataset.
+
+        Args:
+            case_entries: List of dicts with keys:
+                - 'volume_path': Path to NIfTI volume file
+                - 'num_slices': Number of slices in the volume (D)
+            sparse_ratio: Sparsity ratio R.
+            augment: Whether to apply data augmentation.
+            hu_min: HU clipping minimum.
+            hu_max: HU clipping maximum.
+        """
+        self.augment = augment
+        self.hu_min = hu_min
+        self.hu_max = hu_max
+        self.samples: List[Dict] = []
+
+        for entry in case_entries:
+            vol_path = Path(entry["volume_path"])
+            D = entry["num_slices"]
+            R = sparse_ratio
+
+            observed = list(range(0, D, R))
+            for i in range(len(observed) - 1):
+                idx_before = observed[i]
+                idx_after = observed[i + 1]
+                for t in range(idx_before + 1, idx_after):
+                    alpha = (t - idx_before) / (idx_after - idx_before)
+                    self.samples.append({
+                        "volume_path": str(vol_path),
+                        "idx_before": idx_before,
+                        "idx_after": idx_after,
+                        "idx_target": t,
+                        "alpha": alpha,
+                    })
+
+    def _load_slice(self, volume_path: str, z_idx: int) -> np.ndarray:
+        """Load and preprocess a single slice from NIfTI."""
+        import nibabel as nib
+        nii = nib.load(volume_path)
+        raw = nii.dataobj[..., z_idx].astype(np.float32)
+        clipped = np.clip(raw, self.hu_min, self.hu_max)
+        normalized = (clipped - self.hu_min) / (self.hu_max - self.hu_min)
+        return normalized
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        sample = self.samples[idx]
+        vol_path = sample["volume_path"]
+
+        slice_before = self._load_slice(vol_path, sample["idx_before"])
+        slice_after = self._load_slice(vol_path, sample["idx_after"])
+        slice_target = self._load_slice(vol_path, sample["idx_target"])
+
+        input_tensor = torch.from_numpy(
+            np.stack([slice_before, slice_after], axis=0)
+        ).float()
+        target_tensor = torch.from_numpy(slice_target).unsqueeze(0).float()
+        alpha = torch.tensor(sample["alpha"], dtype=torch.float32)
+
+        if self.augment:
+            input_tensor, target_tensor = UNetSliceDataset._augment(
+                input_tensor, target_tensor
+            )
+
+        return {
+            "input": input_tensor,
+            "target": target_tensor,
+            "alpha": alpha,
+        }

@@ -78,7 +78,7 @@ instruction.md
 GITHUB_SETUP.md
 PUSH_TO_GITHUB.md
 setup_github.ps1
-notebooks/
+colab_notebooks/
 kaggle_notebooks/
 BCTD.pptx
 i3NET.pdf
