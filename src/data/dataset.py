@@ -180,14 +180,12 @@ class UNetSliceDataset(Dataset):
 
 
 class LazyUNetSliceDataset(Dataset):
-    """Memory-efficient U-Net dataset with LRU volume cache.
+    """Memory-efficient U-Net dataset with tiny LRU cache.
 
-    Keeps the N most recently used volumes in RAM (default 8, ~2.4GB)
-    instead of all 98+ volumes (~30GB). Cache is an OrderedDict acting
-    as LRU: when a new volume is loaded and cache is full, the oldest
-    entry is evicted.
-
-    Suitable for Kaggle (16GB RAM) with large CT-ORG dataset.
+    Designed for Kaggle 30GB RAM. Uses cache_size=2 by default
+    (~1GB for 2 volumes). MUST be paired with VolumeGroupedSampler
+    to avoid cache thrashing (shuffle=True with random access would
+    constantly evict/reload volumes, causing OOM from load spikes).
     """
 
     def __init__(
@@ -197,20 +195,8 @@ class LazyUNetSliceDataset(Dataset):
         augment: bool = False,
         hu_min: float = -1000.0,
         hu_max: float = 1000.0,
-        cache_size: int = 8,
+        cache_size: int = 2,
     ):
-        """Initialize lazy U-Net dataset.
-
-        Args:
-            case_entries: List of dicts with keys:
-                - 'volume_path': Path to NIfTI volume file
-                - 'num_slices': Number of slices in the volume (D)
-            sparse_ratio: Sparsity ratio R.
-            augment: Whether to apply data augmentation.
-            hu_min: HU clipping minimum.
-            hu_max: HU clipping maximum.
-            cache_size: Max volumes to keep in RAM (each ~300MB).
-        """
         from collections import OrderedDict
 
         self.augment = augment
@@ -219,9 +205,11 @@ class LazyUNetSliceDataset(Dataset):
         self.cache_size = cache_size
         self._cache: OrderedDict = OrderedDict()
         self.samples: List[Dict] = []
+        self._vol_to_sample_indices: Dict[str, List[int]] = {}
 
+        idx = 0
         for entry in case_entries:
-            vol_path = Path(entry["volume_path"])
+            vol_path = str(Path(entry["volume_path"]))
             D = entry["num_slices"]
             R = sparse_ratio
 
@@ -232,30 +220,45 @@ class LazyUNetSliceDataset(Dataset):
                 for t in range(idx_before + 1, idx_after):
                     alpha = (t - idx_before) / (idx_after - idx_before)
                     self.samples.append({
-                        "volume_path": str(vol_path),
+                        "volume_path": vol_path,
                         "idx_before": idx_before,
                         "idx_after": idx_after,
                         "idx_target": t,
                         "alpha": alpha,
                     })
+                    if vol_path not in self._vol_to_sample_indices:
+                        self._vol_to_sample_indices[vol_path] = []
+                    self._vol_to_sample_indices[vol_path].append(idx)
+                    idx += 1
 
     def _get_volume(self, volume_path: str) -> np.ndarray:
-        """Load volume with LRU cache. Returns preprocessed (H,W,D) float32."""
+        """Load volume with LRU cache. Zero-copy preprocessing."""
         if volume_path in self._cache:
             self._cache.move_to_end(volume_path)
             return self._cache[volume_path]
 
+        import gc
         import nibabel as nib
-        nii = nib.load(volume_path)
-        raw = nii.get_fdata().astype(np.float32)
-        clipped = np.clip(raw, self.hu_min, self.hu_max)
-        vol = (clipped - self.hu_min) / (self.hu_max - self.hu_min)
 
         if len(self._cache) >= self.cache_size:
             self._cache.popitem(last=False)
+            gc.collect()
+
+        nii = nib.load(volume_path)
+        vol = np.asarray(nii.dataobj, dtype=np.float32)
+        nii.uncache()
+        del nii
+
+        np.clip(vol, self.hu_min, self.hu_max, out=vol)
+        vol -= self.hu_min
+        vol /= (self.hu_max - self.hu_min)
 
         self._cache[volume_path] = vol
         return vol
+
+    def get_volume_groups(self) -> List[List[int]]:
+        """Return sample indices grouped by volume (for VolumeGroupedSampler)."""
+        return list(self._vol_to_sample_indices.values())
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -284,3 +287,39 @@ class LazyUNetSliceDataset(Dataset):
             "target": target_tensor,
             "alpha": alpha,
         }
+
+
+class VolumeGroupedSampler(torch.utils.data.Sampler):
+    """Sampler that groups samples by source volume for cache-friendly access.
+
+    Without this, shuffle=True causes the DataLoader to request samples from
+    random volumes, thrashing the LRU cache and spiking RAM to OOM.
+
+    With this sampler, consecutive batches come from the same 1-2 volumes,
+    so cache hit rate is ~99% and only 1-2 volumes are in RAM at once.
+
+    Randomization is preserved at two levels:
+    1. Volume order is shuffled each epoch
+    2. Sample order within each volume is shuffled
+    """
+
+    def __init__(self, volume_groups: List[List[int]], shuffle: bool = True):
+        self.volume_groups = volume_groups
+        self.shuffle = shuffle
+        self._total = sum(len(g) for g in volume_groups)
+
+    def __iter__(self):
+        groups = [g.copy() for g in self.volume_groups]
+
+        if self.shuffle:
+            group_order = np.random.permutation(len(groups))
+            for g in groups:
+                np.random.shuffle(g)
+        else:
+            group_order = np.arange(len(groups))
+
+        for gi in group_order:
+            yield from groups[gi]
+
+    def __len__(self) -> int:
+        return self._total
