@@ -80,22 +80,28 @@ class TrainerUNet:
         }
 
     def train(self) -> Dict:
-        """Run full training loop.
+        """Run full training loop with resume support.
 
         Returns:
             Training history dictionary.
         """
-        best_val_loss = float("inf")
+        start_epoch = len(self.history.get("train_loss", []))
+        if start_epoch >= self.num_epochs:
+            print(f"Already completed {start_epoch} epochs, skipping training.")
+            return self.history
 
-        for epoch in range(self.num_epochs):
+        best_val_loss = min(self.history.get("val_loss", [float("inf")])) if self.history.get("val_loss") else float("inf")
+
+        if start_epoch > 0:
+            print(f"Resuming from epoch {start_epoch + 1}/{self.num_epochs}")
+
+        for epoch in range(start_epoch, self.num_epochs):
             t0 = time.time()
 
-            # Train
             train_loss = self._train_epoch()
             self.history["train_loss"].append(train_loss)
             self.history["lr"].append(self.optimizer.param_groups[0]["lr"])
 
-            # Validate
             val_loss = 0.0
             val_psnr = 0.0
             if self.val_loader is not None:
@@ -103,7 +109,6 @@ class TrainerUNet:
                 self.history["val_loss"].append(val_loss)
                 self.history["val_psnr"].append(val_psnr)
 
-                # Save best model
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     self._save_checkpoint("best.pt", epoch)
@@ -120,11 +125,9 @@ class TrainerUNet:
                 f"Time: {elapsed:.1f}s"
             )
 
-            # Periodic checkpoint
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 5 == 0:
                 self._save_checkpoint(f"epoch_{epoch + 1}.pt", epoch)
 
-        # Save final model and history
         self._save_checkpoint("final.pt", self.num_epochs - 1)
         self._save_history()
 
