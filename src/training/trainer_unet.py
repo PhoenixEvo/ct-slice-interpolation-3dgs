@@ -45,6 +45,9 @@ class TrainerUNet:
             checkpoint_dir: Directory to save checkpoints.
             device: Device to train on.
         """
+        if device == "cuda" and torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -138,8 +141,8 @@ class TrainerUNet:
         num_batches = 0
 
         for batch in self.train_loader:
-            input_slices = batch["input"].to(self.device)
-            target_slices = batch["target"].to(self.device)
+            input_slices = batch["input"].to(self.device, non_blocking=True)
+            target_slices = batch["target"].to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad()
 
@@ -169,8 +172,8 @@ class TrainerUNet:
         num_batches = 0
 
         for batch in self.val_loader:
-            input_slices = batch["input"].to(self.device)
-            target_slices = batch["target"].to(self.device)
+            input_slices = batch["input"].to(self.device, non_blocking=True)
+            target_slices = batch["target"].to(self.device, non_blocking=True)
 
             with autocast(enabled=self.mixed_precision):
                 predictions = self.model(input_slices)

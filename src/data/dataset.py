@@ -180,10 +180,13 @@ class UNetSliceDataset(Dataset):
 
 
 class LazyUNetSliceDataset(Dataset):
-    """Memory-efficient U-Net dataset that loads slices on demand from NIfTI.
+    """Memory-efficient U-Net dataset with LRU volume cache.
 
-    Instead of holding all volumes in RAM, this dataset stores file paths
-    and loads only the needed slices when __getitem__ is called.
+    Keeps the N most recently used volumes in RAM (default 8, ~2.4GB)
+    instead of all 98+ volumes (~30GB). Cache is an OrderedDict acting
+    as LRU: when a new volume is loaded and cache is full, the oldest
+    entry is evicted.
+
     Suitable for Kaggle (16GB RAM) with large CT-ORG dataset.
     """
 
@@ -194,6 +197,7 @@ class LazyUNetSliceDataset(Dataset):
         augment: bool = False,
         hu_min: float = -1000.0,
         hu_max: float = 1000.0,
+        cache_size: int = 8,
     ):
         """Initialize lazy U-Net dataset.
 
@@ -205,10 +209,15 @@ class LazyUNetSliceDataset(Dataset):
             augment: Whether to apply data augmentation.
             hu_min: HU clipping minimum.
             hu_max: HU clipping maximum.
+            cache_size: Max volumes to keep in RAM (each ~300MB).
         """
+        from collections import OrderedDict
+
         self.augment = augment
         self.hu_min = hu_min
         self.hu_max = hu_max
+        self.cache_size = cache_size
+        self._cache: OrderedDict = OrderedDict()
         self.samples: List[Dict] = []
 
         for entry in case_entries:
@@ -230,25 +239,34 @@ class LazyUNetSliceDataset(Dataset):
                         "alpha": alpha,
                     })
 
-    def _load_slice(self, volume_path: str, z_idx: int) -> np.ndarray:
-        """Load and preprocess a single slice from NIfTI."""
+    def _get_volume(self, volume_path: str) -> np.ndarray:
+        """Load volume with LRU cache. Returns preprocessed (H,W,D) float32."""
+        if volume_path in self._cache:
+            self._cache.move_to_end(volume_path)
+            return self._cache[volume_path]
+
         import nibabel as nib
         nii = nib.load(volume_path)
-        raw = nii.dataobj[..., z_idx].astype(np.float32)
+        raw = nii.get_fdata().astype(np.float32)
         clipped = np.clip(raw, self.hu_min, self.hu_max)
-        normalized = (clipped - self.hu_min) / (self.hu_max - self.hu_min)
-        return normalized
+        vol = (clipped - self.hu_min) / (self.hu_max - self.hu_min)
+
+        if len(self._cache) >= self.cache_size:
+            self._cache.popitem(last=False)
+
+        self._cache[volume_path] = vol
+        return vol
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.samples[idx]
-        vol_path = sample["volume_path"]
+        vol = self._get_volume(sample["volume_path"])
 
-        slice_before = self._load_slice(vol_path, sample["idx_before"])
-        slice_after = self._load_slice(vol_path, sample["idx_after"])
-        slice_target = self._load_slice(vol_path, sample["idx_target"])
+        slice_before = vol[:, :, sample["idx_before"]]
+        slice_after = vol[:, :, sample["idx_after"]]
+        slice_target = vol[:, :, sample["idx_target"]]
 
         input_tensor = torch.from_numpy(
             np.stack([slice_before, slice_after], axis=0)

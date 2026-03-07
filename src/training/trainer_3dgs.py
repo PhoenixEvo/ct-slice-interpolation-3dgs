@@ -132,11 +132,15 @@ class Trainer3DGS:
         # Setup optimizer (with per-parameter learning rates)
         self._setup_optimizer(gs_config)
 
-        # Prepare observed slice tensors
+        # Prepare observed slice tensors (pre-loaded on GPU for fast training)
         self.observed_slices = {}
         for idx in observed_indices:
-            s = torch.from_numpy(volume[:, :, idx]).unsqueeze(0).float().to(device)
+            s = torch.from_numpy(
+                volume[:, :, idx]
+            ).unsqueeze(0).float().to(device, non_blocking=True)
             self.observed_slices[int(idx)] = s
+        if device == "cuda":
+            torch.cuda.synchronize()
 
         # Training history
         self.history = {
@@ -388,21 +392,25 @@ class Trainer3DGS:
         self.gaussian_model.eval()
         params = self.gaussian_model.get_params()
 
-        results = np.zeros(
-            (self.H, self.W, len(self.target_indices)), dtype=np.float32
-        )
+        n_targets = len(self.target_indices)
+        results = np.zeros((self.H, self.W, n_targets), dtype=np.float32)
 
-        for i, z_idx in enumerate(self.target_indices):
-            rendered = self.renderer(
-                params["positions"],
-                params["scales"],
-                params["opacity"],
-                params["intensity"],
-                float(z_idx),
-            )
-            # Clamp to [0, 1]
-            rendered = torch.clamp(rendered, 0.0, 1.0)
-            results[:, :, i] = rendered.squeeze().cpu().numpy()
+        batch_size = 16
+        for start in range(0, n_targets, batch_size):
+            end = min(start + batch_size, n_targets)
+            batch_rendered = []
+            for i in range(start, end):
+                rendered = self.renderer(
+                    params["positions"],
+                    params["scales"],
+                    params["opacity"],
+                    params["intensity"],
+                    float(self.target_indices[i]),
+                )
+                batch_rendered.append(torch.clamp(rendered, 0.0, 1.0))
+
+            stacked = torch.cat(batch_rendered, dim=0)
+            results[:, :, start:end] = stacked.squeeze(1).cpu().numpy().transpose(1, 2, 0)
 
         return results
 
