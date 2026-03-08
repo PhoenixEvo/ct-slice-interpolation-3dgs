@@ -125,7 +125,7 @@ class TrainerUNet:
                 f"Time: {elapsed:.1f}s"
             )
 
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 3 == 0:
                 self._save_checkpoint(f"epoch_{epoch + 1}.pt", epoch)
 
         self._save_checkpoint("final.pt", self.num_epochs - 1)
