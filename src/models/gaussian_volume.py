@@ -97,47 +97,57 @@ class GaussianVolume(nn.Module):
         init_scale_xy: float = 2.0,
         init_scale_z: float = 1.0,
         init_opacity: float = 0.8,
+        max_gaussians: int = 500000,
         device: str = "cuda",
     ) -> "GaussianVolume":
         """Initialize Gaussians from a grid on observed slices.
 
         Places Gaussians on a subsampled grid at each observed z-position,
-        with intensity initialized from the CT volume.
+        with intensity initialized from the CT volume. Automatically adjusts
+        subsample_xy to keep total Gaussians within max_gaussians.
 
         Args:
             volume: Preprocessed CT volume (H, W, D), values in [0, 1].
             observed_indices: Indices of observed slices.
-            subsample_xy: Subsampling factor in x and y.
+            subsample_xy: Base subsampling factor in x and y.
             init_scale_xy: Initial scale in x and y directions.
             init_scale_z: Initial scale in z direction.
             init_opacity: Initial opacity (pre-sigmoid value).
+            max_gaussians: Maximum number of initial Gaussians.
             device: Computation device.
 
         Returns:
             Initialized GaussianVolume instance.
         """
         H, W, D = volume.shape
+        n_obs = len(observed_indices)
 
-        # Create subsampled grid positions on observed slices
+        # Auto-increase subsample_xy to fit within budget
+        raw_count = (H // subsample_xy) * (W // subsample_xy) * n_obs
+        if raw_count > max_gaussians:
+            required_s = int(np.ceil(np.sqrt(H * W * n_obs / max_gaussians)))
+            subsample_xy = max(subsample_xy, required_s)
+
         x_coords = np.arange(0, H, subsample_xy).astype(np.float32)
         y_coords = np.arange(0, W, subsample_xy).astype(np.float32)
         z_coords = observed_indices.astype(np.float32)
 
-        # Create meshgrid
         xx, yy, zz = np.meshgrid(x_coords, y_coords, z_coords, indexing="ij")
         positions = np.stack(
             [xx.ravel(), yy.ravel(), zz.ravel()], axis=-1
         )  # (N, 3)
 
         num_gaussians = positions.shape[0]
+        print(
+            f"  Grid init: subsample_xy={subsample_xy}, "
+            f"{len(x_coords)}x{len(y_coords)}x{n_obs} = {num_gaussians} Gaussians"
+        )
 
-        # Initialize intensities from volume
         x_idx = np.clip(xx.ravel().astype(int), 0, H - 1)
         y_idx = np.clip(yy.ravel().astype(int), 0, W - 1)
         z_idx = np.clip(zz.ravel().astype(int), 0, D - 1)
         intensities = volume[x_idx, y_idx, z_idx]
 
-        # Create instance
         model = cls(num_gaussians, (H, W, D), device)
 
         # Set parameters
@@ -173,12 +183,14 @@ class GaussianVolume(nn.Module):
         init_scale_xy: float = 2.0,
         init_scale_z: float = 1.0,
         init_opacity: float = 0.8,
+        max_gaussians: int = 500000,
         device: str = "cuda",
     ) -> "GaussianVolume":
         """Initialize Gaussians with higher density near edges.
 
         Uses Sobel edge detection to place more Gaussians near organ
-        boundaries for better detail preservation.
+        boundaries for better detail preservation. Auto-adjusts
+        subsample_xy to keep total within max_gaussians.
 
         Args:
             volume: Preprocessed CT volume (H, W, D).
@@ -188,6 +200,7 @@ class GaussianVolume(nn.Module):
             init_scale_xy: Initial scale in x, y.
             init_scale_z: Initial scale in z.
             init_opacity: Initial opacity.
+            max_gaussians: Maximum number of initial Gaussians.
             device: Computation device.
 
         Returns:
@@ -196,6 +209,17 @@ class GaussianVolume(nn.Module):
         from scipy import ndimage
 
         H, W, D = volume.shape
+        n_obs = len(observed_indices)
+
+        # Adaptive has ~2x Gaussians vs grid due to edge points
+        adaptive_factor = 2.0
+        raw_count = (H // subsample_xy) * (W // subsample_xy) * n_obs * adaptive_factor
+        if raw_count > max_gaussians:
+            required_s = int(np.ceil(np.sqrt(
+                H * W * n_obs * adaptive_factor / max_gaussians
+            )))
+            subsample_xy = max(subsample_xy, required_s)
+
         all_positions = []
         all_intensities = []
 
@@ -239,9 +263,19 @@ class GaussianVolume(nn.Module):
 
         positions = np.array(all_positions, dtype=np.float32)
         intensities = np.array(all_intensities, dtype=np.float32)
-        num_gaussians = positions.shape[0]
 
-        # Create instance
+        # Final safety cap via random subsampling
+        if positions.shape[0] > max_gaussians:
+            idx = np.random.choice(positions.shape[0], max_gaussians, replace=False)
+            positions = positions[idx]
+            intensities = intensities[idx]
+
+        num_gaussians = positions.shape[0]
+        print(
+            f"  Adaptive init: subsample_xy={subsample_xy}, "
+            f"{num_gaussians} Gaussians (from {len(all_positions)} candidates)"
+        )
+
         model = cls(num_gaussians, (H, W, D), device)
 
         with torch.no_grad():

@@ -59,8 +59,8 @@ class Trainer3DGS:
         train_config = config.get("training", {})
         self._gs_config = gs_config
 
-        # Initialize Gaussian Volume (support adaptive edge-aware init)
         init_mode = gs_config.get("init_mode", "grid")
+        max_gs = gs_config.get("max_gaussians", 500000)
         if init_mode == "adaptive":
             self.gaussian_model = GaussianVolume.from_volume_adaptive(
                 volume=volume,
@@ -70,6 +70,7 @@ class Trainer3DGS:
                 init_scale_xy=gs_config.get("init_scale_xy", 2.0),
                 init_scale_z=gs_config.get("init_scale_z", 1.0),
                 init_opacity=gs_config.get("init_opacity", 0.8),
+                max_gaussians=max_gs,
                 device=device,
             )
         else:
@@ -80,6 +81,7 @@ class Trainer3DGS:
                 init_scale_xy=gs_config.get("init_scale_xy", 2.0),
                 init_scale_z=gs_config.get("init_scale_z", 1.0),
                 init_opacity=gs_config.get("init_opacity", 0.8),
+                max_gaussians=max_gs,
                 device=device,
             )
 
