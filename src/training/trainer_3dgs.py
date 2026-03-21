@@ -61,6 +61,13 @@ class Trainer3DGS:
 
         init_mode = gs_config.get("init_mode", "grid")
         max_gs = gs_config.get("max_gaussians", 500000)
+
+        # Adaptive z-scale: cover inter-slice gaps based on sparse ratio
+        sparse_ratio = self._infer_sparse_ratio(observed_indices)
+        base_scale_z = gs_config.get("init_scale_z", 1.0)
+        adaptive_scale_z = max(base_scale_z, sparse_ratio * 0.6)
+        print(f"  Sparse ratio ~{sparse_ratio}, init_scale_z: {base_scale_z} -> {adaptive_scale_z:.2f}")
+
         if init_mode == "adaptive":
             self.gaussian_model = GaussianVolume.from_volume_adaptive(
                 volume=volume,
@@ -68,7 +75,7 @@ class Trainer3DGS:
                 subsample_xy=gs_config.get("subsample_xy", 4),
                 edge_boost=gs_config.get("edge_boost", 2.0),
                 init_scale_xy=gs_config.get("init_scale_xy", 2.0),
-                init_scale_z=gs_config.get("init_scale_z", 1.0),
+                init_scale_z=adaptive_scale_z,
                 init_opacity=gs_config.get("init_opacity", 0.8),
                 max_gaussians=max_gs,
                 device=device,
@@ -79,7 +86,7 @@ class Trainer3DGS:
                 observed_indices=observed_indices,
                 subsample_xy=gs_config.get("subsample_xy", 4),
                 init_scale_xy=gs_config.get("init_scale_xy", 2.0),
-                init_scale_z=gs_config.get("init_scale_z", 1.0),
+                init_scale_z=adaptive_scale_z,
                 init_opacity=gs_config.get("init_opacity", 0.8),
                 max_gaussians=max_gs,
                 device=device,
@@ -93,16 +100,18 @@ class Trainer3DGS:
             render_mode=gs_config.get("render_mode", "weighted"),
         ).to(device)
 
-        # Initialize Loss
         self.criterion = TotalLoss(
             lambda_smooth=loss_config.get("lambda_smooth", 0.01),
             lambda_edge=loss_config.get("lambda_edge", 0.005),
+            lambda_tv=loss_config.get("lambda_tv", 0.001),
             l1_weight=loss_config.get("l1_weight", 1.0),
             ssim_weight=loss_config.get("ssim_weight", 0.1),
+            multiscale=loss_config.get("multiscale", True),
         ).to(device)
 
         # Training parameters
         self.num_iterations = gs_config.get("num_iterations", 2000)
+        self.batch_slices = gs_config.get("batch_slices", 4)
         self.warmup_iterations = gs_config.get("warmup_iterations", 200)
         self.densify_interval = gs_config.get("densify_interval", 100)
         self.densify_grad_threshold = gs_config.get(
@@ -150,10 +159,20 @@ class Trainer3DGS:
             "loss_rec": [],
             "loss_smooth": [],
             "loss_edge": [],
+            "loss_tv": [],
             "num_gaussians": [],
             "psnr_train": [],
             "lr_position": [],
         }
+
+    @staticmethod
+    def _infer_sparse_ratio(observed_indices: np.ndarray) -> int:
+        """Infer the sparse ratio from observed slice indices."""
+        if len(observed_indices) < 2:
+            return 2
+        sorted_idx = np.sort(observed_indices)
+        gaps = np.diff(sorted_idx)
+        return int(np.median(gaps)) if len(gaps) > 0 else 2
 
     def _get_position_lr(self, iteration: int) -> float:
         """Compute position learning rate with exponential decay."""
@@ -237,82 +256,93 @@ class Trainer3DGS:
         Returns:
             Training history dictionary.
         """
+        B = min(self.batch_slices, len(self.observed_indices))
         print(
             f"Starting 3DGS training: {self.gaussian_model.num_gaussians} "
             f"Gaussians, {len(self.observed_indices)} observed slices, "
-            f"volume shape {self.volume.shape}"
+            f"batch_slices={B}, volume shape {self.volume.shape}"
         )
 
         t_start = time.time()
-        obs_indices_list = list(self.observed_indices)
+        obs_indices_arr = np.array(list(self.observed_indices))
 
         for iteration in range(self.num_iterations):
-            # Update position LR schedule
             self._update_learning_rate(iteration)
+
+            # Regularization annealing: coarse-to-fine
+            progress = iteration / max(1, self.num_iterations - 1)
+            self.criterion.set_progress(progress)
 
             self.optimizer.zero_grad()
 
-            # Randomly sample an observed slice
-            z_idx = obs_indices_list[
-                np.random.randint(len(obs_indices_list))
-            ]
-            gt_slice = self.observed_slices[z_idx]
+            batch_z = np.random.choice(obs_indices_arr, B, replace=False)
 
             with autocast(enabled=self.mixed_precision):
                 params = self.gaussian_model.get_params()
-                rendered = self.renderer(
-                    params["positions"],
-                    params["scales"],
-                    params["opacity"],
-                    params["intensity"],
-                    float(z_idx),
-                )
 
-                # Smoothness regularization every 3 iterations to save render cost
-                adjacent_pred = None
-                adjacent_gt = None
-                if iteration % 3 == 0:
-                    neighbor_z = z_idx + 1 if z_idx + 1 < self.D else z_idx - 1
-                    if neighbor_z in self.observed_slices:
-                        adjacent_gt = self.observed_slices[neighbor_z]
-                        adjacent_pred = self.renderer(
-                            params["positions"],
-                            params["scales"],
-                            params["opacity"],
-                            params["intensity"],
-                            float(neighbor_z),
-                        )
+                total_loss = torch.tensor(0.0, device=self.device)
+                total_rec = torch.tensor(0.0, device=self.device)
+                total_smooth = torch.tensor(0.0, device=self.device)
+                total_edge = torch.tensor(0.0, device=self.device)
+                total_tv = torch.tensor(0.0, device=self.device)
+                last_rendered = None
+                last_gt = None
 
-                loss_dict = self.criterion(
-                    rendered, gt_slice, adjacent_pred, adjacent_gt
-                )
-                loss = loss_dict["total"]
+                for z_idx in batch_z:
+                    z_idx = int(z_idx)
+                    gt_slice = self.observed_slices[z_idx]
+                    rendered = self.renderer(
+                        params["positions"],
+                        params["scales"],
+                        params["opacity"],
+                        params["intensity"],
+                        float(z_idx),
+                    )
 
-            # Backward pass
+                    adjacent_pred = None
+                    adjacent_gt = None
+                    if iteration % 3 == 0:
+                        neighbor_z = z_idx + 1 if z_idx + 1 < self.D else z_idx - 1
+                        if neighbor_z in self.observed_slices:
+                            adjacent_gt = self.observed_slices[neighbor_z]
+                            adjacent_pred = self.renderer(
+                                params["positions"],
+                                params["scales"],
+                                params["opacity"],
+                                params["intensity"],
+                                float(neighbor_z),
+                            )
+
+                    loss_dict = self.criterion(
+                        rendered, gt_slice, adjacent_pred, adjacent_gt
+                    )
+                    total_loss = total_loss + loss_dict["total"]
+                    total_rec = total_rec + loss_dict["reconstruction"]
+                    total_smooth = total_smooth + loss_dict["smoothness"]
+                    total_edge = total_edge + loss_dict["edge"]
+                    total_tv = total_tv + loss_dict["tv"]
+                    last_rendered = rendered
+                    last_gt = gt_slice
+
+                loss = total_loss / B
+
             self.scaler.scale(loss).backward()
-
-            # Accumulate gradients for densification
             self.gaussian_model.accumulate_gradients()
-
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            # Logging
             if iteration % self.log_interval == 0:
                 with torch.no_grad():
-                    mse = ((rendered - gt_slice) ** 2).mean().item()
+                    mse = ((last_rendered - last_gt) ** 2).mean().item()
                     psnr = 10 * np.log10(1.0 / max(mse, 1e-10))
 
                 cur_lr = self._get_position_lr(iteration)
                 self.history["iteration"].append(iteration)
-                self.history["loss_total"].append(loss_dict["total"].item())
-                self.history["loss_rec"].append(
-                    loss_dict["reconstruction"].item()
-                )
-                self.history["loss_smooth"].append(
-                    loss_dict["smoothness"].item()
-                )
-                self.history["loss_edge"].append(loss_dict["edge"].item())
+                self.history["loss_total"].append((total_loss / B).item())
+                self.history["loss_rec"].append((total_rec / B).item())
+                self.history["loss_smooth"].append((total_smooth / B).item())
+                self.history["loss_edge"].append((total_edge / B).item())
+                self.history["loss_tv"].append((total_tv / B).item())
                 self.history["num_gaussians"].append(
                     self.gaussian_model.num_gaussians
                 )
@@ -323,22 +353,29 @@ class Trainer3DGS:
                     elapsed = time.time() - t_start
                     print(
                         f"Iter {iteration}/{self.num_iterations} | "
-                        f"Loss: {loss_dict['total'].item():.6f} | "
-                        f"Rec: {loss_dict['reconstruction'].item():.6f} | "
+                        f"Loss: {(total_loss / B).item():.6f} | "
+                        f"Rec: {(total_rec / B).item():.6f} | "
                         f"PSNR: {psnr:.2f} dB | "
                         f"#GS: {self.gaussian_model.num_gaussians} | "
                         f"LR_pos: {cur_lr:.6f} | "
                         f"Time: {elapsed:.1f}s"
                     )
 
-            # Densification and pruning
+            # Progressive densification: lower threshold early (more aggressive),
+            # higher threshold late (conservative refinement)
             if (
                 iteration > self.warmup_iterations
                 and iteration % self.densify_interval == 0
                 and iteration < self.num_iterations * 0.8
             ):
+                phase = (iteration - self.warmup_iterations) / max(
+                    1, self.num_iterations * 0.8 - self.warmup_iterations
+                )
+                # Threshold ramps from 0.5x to 1.5x of base
+                adaptive_thresh = self.densify_grad_threshold * (0.5 + phase)
+
                 stats = self.gaussian_model.densify_and_prune(
-                    grad_threshold=self.densify_grad_threshold,
+                    grad_threshold=adaptive_thresh,
                     opacity_threshold=self.prune_opacity_threshold,
                     max_gaussians=self.max_gaussians,
                 )

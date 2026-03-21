@@ -149,13 +149,6 @@ class CombinedReconstructionLoss(nn.Module):
         ssim_weight: float = 0.1,
         data_range: float = 1.0,
     ):
-        """Initialize combined loss.
-
-        Args:
-            l1_weight: Weight for L1 loss.
-            ssim_weight: Weight for SSIM loss.
-            data_range: Data range for SSIM.
-        """
         super().__init__()
         self.l1_weight = l1_weight
         self.ssim_weight = ssim_weight
@@ -165,16 +158,53 @@ class CombinedReconstructionLoss(nn.Module):
     def forward(
         self, prediction: torch.Tensor, target: torch.Tensor
     ) -> torch.Tensor:
-        """Compute combined loss.
-
-        Args:
-            prediction: Predicted image.
-            target: Ground truth image.
-
-        Returns:
-            Scalar combined loss.
-        """
         loss = self.l1_weight * self.l1_loss(prediction, target)
         if self.ssim_weight > 0:
             loss = loss + self.ssim_weight * self.ssim_loss(prediction, target)
         return loss
+
+
+class MultiScaleReconstructionLoss(nn.Module):
+    """Multi-scale L1 + SSIM loss computed at multiple resolutions.
+
+    Computes reconstruction loss at the original resolution and at
+    successively downsampled versions (1/2, 1/4). This encourages
+    the model to capture both coarse global structure and fine local
+    details, acting as an implicit coarse-to-fine objective.
+    """
+
+    def __init__(
+        self,
+        l1_weight: float = 1.0,
+        ssim_weight: float = 0.1,
+        num_scales: int = 3,
+        scale_weights: Optional[list] = None,
+        data_range: float = 1.0,
+    ):
+        super().__init__()
+        self.num_scales = num_scales
+        self.scale_weights = scale_weights or [1.0, 0.5, 0.25][:num_scales]
+        self.losses = nn.ModuleList([
+            CombinedReconstructionLoss(l1_weight, ssim_weight, data_range)
+            for _ in range(num_scales)
+        ])
+
+    def forward(
+        self, prediction: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        if prediction.dim() == 3:
+            prediction = prediction.unsqueeze(0)
+        if target.dim() == 3:
+            target = target.unsqueeze(0)
+
+        total = self.scale_weights[0] * self.losses[0](prediction, target)
+
+        pred_down = prediction
+        tgt_down = target
+        for s in range(1, self.num_scales):
+            pred_down = F.avg_pool2d(pred_down, 2)
+            tgt_down = F.avg_pool2d(tgt_down, 2)
+            total = total + self.scale_weights[s] * self.losses[s](pred_down, tgt_down)
+
+        weight_sum = sum(self.scale_weights[:self.num_scales])
+        return total / weight_sum

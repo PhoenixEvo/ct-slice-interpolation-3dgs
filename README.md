@@ -11,10 +11,14 @@ This project explores whether **3D Gaussian Splatting** -- originally developed 
 ## Key Contributions
 
 - **Custom 3DGS pipeline** adapted for axis-aligned medical slice rendering (no rotation parameters, reducing model complexity)
-- **Medical-specific loss functions**: z-axis smoothness regularization + Sobel-based edge preservation
+- **Separable differentiable rendering**: Exploits axis-aligned Gaussian structure for O(H·K + W·K) rendering via matrix multiplication, ~50-100x faster than naive per-pixel computation
+- **Multi-scale reconstruction loss**: Computes L1 + SSIM at 3 resolution levels (1x, 1/2x, 1/4x) for simultaneous coarse structure and fine detail learning
+- **Medical-specific regularization**: z-axis smoothness with coarse-to-fine annealing, Sobel-based edge preservation, and Total Variation loss for spatial denoising
+- **Adaptive initialization**: Gaussian z-scale automatically adjusted based on sparse ratio; spatial subsampling adapts to keep count within budget
+- **Progressive densification**: Gradient threshold ramps from aggressive (0.5x) to conservative (1.5x) over training, promoting rapid coverage then fine refinement
 - **Comprehensive comparison** against classical interpolation (nearest/linear/cubic) and supervised U-Net 2D
 - **ROI-based evaluation**: Per-organ metrics (liver, lungs, kidneys, bladder, bone) using segmentation masks
-- **Ablation studies**: Quantifying the impact of each regularization component
+- **Ablation studies**: Quantifying the impact of each regularization and rendering component
 - **Kaggle-optimized pipeline**: Multi-GPU support (T4x2), memory-efficient lazy loading, session auto-resume
 
 ## Project Structure
@@ -32,8 +36,8 @@ TLCN/
       unet2d.py              # U-Net 2D baseline
       classical_interp.py    # Nearest/linear/cubic + streaming slice-by-slice mode
     losses/
-      reconstruction.py      # L1, L2, SSIM, combined reconstruction loss
-      regularization.py      # SmoothnessLoss, EdgePreservationLoss
+      reconstruction.py      # L1, L2, SSIM, combined + multi-scale reconstruction loss
+      regularization.py      # SmoothnessLoss, EdgePreservationLoss, TotalVariationLoss
     training/
       trainer_3dgs.py        # Per-volume 3DGS optimizer with densification/pruning
       trainer_unet.py        # U-Net training with checkpoint resume support
@@ -136,17 +140,26 @@ contribution = intensity × sigmoid(opacity) × w_z × G_2d(x, y)
 ```
 Contributions are combined via weighted sum (normalized). **Separable rendering** exploits the axis-aligned property: G(x,y) = G_x(x) · G_y(y), enabling the full render to be computed via two matrix multiplications instead of materializing the (H, W, K) tensor. Z-threshold filtering (3σ) further reduces the number of active Gaussians per slice.
 
-**Combined loss**:
+**Combined loss** (multi-scale with regularization annealing):
 ```
-L = L1(pred, gt) + 0.1 * SSIM(pred, gt) + 0.01 * L_smooth + 0.005 * L_edge
+L_rec = Σ_{s=0}^{2} w_s · [L1(pred_s, gt_s) + 0.1 · SSIM(pred_s, gt_s)]
+L = L_rec + λ_smooth(t) · L_smooth + 0.005 · L_edge + 0.001 · L_tv
 ```
-Where L_smooth enforces z-axis continuity and L_edge preserves anatomical boundaries via Sobel gradient matching.
+Where:
+- **L_rec**: Multi-scale reconstruction loss at 3 resolution levels (1x, 1/2x, 1/4x), ensuring both coarse anatomy and fine detail are captured
+- **L_smooth**: z-axis continuity between adjacent rendered slices (annealed: starts at 2× then decays to 0.5× for coarse-to-fine training)
+- **L_edge**: Sobel gradient matching to preserve anatomical boundaries (organ edges, bone margins)
+- **L_tv**: Anisotropic Total Variation for spatial denoising without edge blurring
 
-**Adaptive densification/pruning** (every 100 iterations):
-- **Split**: Large Gaussians with high positional gradients are split into two
-- **Clone**: Small Gaussians with high gradients are duplicated
+**Adaptive initialization**:
+- **z-scale**: Automatically set to max(1.0, R × 0.6) where R is the sparse ratio, ensuring Gaussians bridge inter-slice gaps
+- **xy-subsampling**: Dynamically adjusted so initial count stays within budget (default 500K)
+
+**Progressive densification/pruning** (every 100 iterations):
+- **Early training**: Low gradient threshold (0.5× base) → aggressive densification for rapid coverage
+- **Late training**: High gradient threshold (1.5× base) → conservative refinement only where needed
 - **Prune**: Low-opacity Gaussians (< 0.01) are removed
-- Max 500K Gaussians per volume
+- Max 500K Gaussians per volume (800K in high-quality mode)
 
 ## Dataset
 
@@ -176,12 +189,14 @@ Download: [TCIA CT-ORG Collection](https://wiki.cancerimagingarchive.net/pages/v
 
 Variants tested in NB05 to isolate the contribution of each component:
 
-| Variant | Smoothness | Edge | Purpose |
-|---------|:----------:|:----:|---------|
-| full | yes | yes | Complete model |
-| no_smooth | no | yes | Effect of z-axis smoothness |
-| no_edge | yes | no | Effect of edge preservation |
-| no_reg | no | no | Raw 3DGS without regularization |
+| Variant | Multi-scale | Smoothness | Edge | TV | Annealing | Purpose |
+|---------|:-----------:|:----------:|:----:|:--:|:---------:|---------|
+| full | yes | yes | yes | yes | yes | Complete model |
+| no_multiscale | no | yes | yes | yes | yes | Effect of multi-scale loss |
+| no_smooth | yes | no | yes | yes | yes | Effect of z-axis smoothness |
+| no_edge | yes | yes | no | yes | yes | Effect of edge preservation |
+| no_tv | yes | yes | yes | no | yes | Effect of TV denoising |
+| no_reg | no | no | no | no | no | Raw 3DGS baseline |
 
 ## Outputs
 
@@ -230,17 +245,18 @@ All hyperparameters are centralized in `configs/default.yaml`:
 ```yaml
 gaussian:
   init_mode: "grid"          # or "adaptive" (edge-aware initialization)
-  num_iterations: 3000
+  num_iterations: 5000       # 10000+ for high quality
+  batch_slices: 4            # Multi-slice batch training
   max_gaussians: 500000
-  lr_position: 0.01
-  densify_interval: 100
-  prune_opacity_threshold: 0.01
+  render_mode: "weighted"    # Separable rendering via matmul
 
 loss:
   l1_weight: 1.0
   ssim_weight: 0.1
-  lambda_smooth: 0.01
+  lambda_smooth: 0.01       # Annealed: 2x -> 0.5x during training
   lambda_edge: 0.005
+  lambda_tv: 0.001           # Total variation for spatial denoising
+  multiscale: true           # Multi-scale loss (1x, 1/2x, 1/4x)
 
 unet:
   features: [32, 64, 128, 256]

@@ -47,7 +47,8 @@ gaussian:
   lr_scale: 0.005
   lr_opacity: 0.01
   lr_intensity: 0.01
-  num_iterations: 3000       # Increased for better convergence
+  num_iterations: 5000       # Standard quality; use 10000+ for high quality
+  batch_slices: 4            # Observed slices per iteration (1=original, 4-8=better gradients)
   warmup_iterations: 200
 
   # Densification & pruning
@@ -67,8 +68,10 @@ gaussian:
 loss:
   l1_weight: 1.0
   ssim_weight: 0.1
-  lambda_smooth: 0.01
-  lambda_edge: 0.005
+  lambda_smooth: 0.01       # z-axis smoothness (annealed: 2x -> 0.5x during training)
+  lambda_edge: 0.005        # Sobel gradient matching
+  lambda_tv: 0.001          # Total variation for spatial denoising
+  multiscale: true           # Multi-scale reconstruction loss (1x, 1/2x, 1/4x)
 
 # --- Evaluation ---
 eval:

@@ -1,6 +1,6 @@
 """
 Regularization losses for 3DGS CT slice interpolation.
-Includes smoothness along z-axis and edge preservation.
+Includes smoothness along z-axis, edge preservation, and total variation.
 """
 
 import torch
@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-from .reconstruction import CombinedReconstructionLoss
+from .reconstruction import CombinedReconstructionLoss, MultiScaleReconstructionLoss
 
 
 class SmoothnessLoss(nn.Module):
@@ -96,38 +96,77 @@ class EdgePreservationLoss(nn.Module):
         return F.l1_loss(pred_grad, target_grad)
 
 
-class TotalLoss(nn.Module):
-    """Total loss combining reconstruction and regularization.
+class TotalVariationLoss(nn.Module):
+    """Anisotropic Total Variation loss for spatial denoising.
 
-    L_total = L_rec + lambda_smooth * L_smooth + lambda_edge * L_edge
+    Penalizes high-frequency noise in rendered slices while preserving
+    sharp edges. Uses anisotropic TV which sums absolute differences
+    along each axis independently (less edge-blurring than isotropic TV).
+
+    L_tv = mean(|I[i+1,j] - I[i,j]| + |I[i,j+1] - I[i,j]|)
+    """
+
+    def forward(self, prediction: torch.Tensor) -> torch.Tensor:
+        if prediction.dim() == 3:
+            prediction = prediction.unsqueeze(0)
+        diff_h = torch.abs(prediction[:, :, 1:, :] - prediction[:, :, :-1, :])
+        diff_w = torch.abs(prediction[:, :, :, 1:] - prediction[:, :, :, :-1])
+        return diff_h.mean() + diff_w.mean()
+
+
+class TotalLoss(nn.Module):
+    """Total loss combining multi-scale reconstruction and regularization.
+
+    L_total = L_rec_ms + lambda_smooth * L_smooth + lambda_edge * L_edge
+              + lambda_tv * L_tv
+
+    Supports regularization annealing via set_progress() for coarse-to-fine
+    training: smoothness starts high and decays, allowing the model to first
+    capture global anatomy then refine local detail.
     """
 
     def __init__(
         self,
         lambda_smooth: float = 0.01,
         lambda_edge: float = 0.005,
+        lambda_tv: float = 0.001,
         l1_weight: float = 1.0,
         ssim_weight: float = 0.1,
+        multiscale: bool = True,
         data_range: float = 1.0,
     ):
-        """Initialize total loss.
-
-        Args:
-            lambda_smooth: Weight for smoothness regularization.
-            lambda_edge: Weight for edge preservation loss.
-            l1_weight: Weight for L1 reconstruction loss.
-            ssim_weight: Weight for SSIM loss component.
-            data_range: Data range for SSIM computation.
-        """
         super().__init__()
-        self.lambda_smooth = lambda_smooth
+        self.lambda_smooth_init = lambda_smooth
         self.lambda_edge = lambda_edge
+        self.lambda_tv = lambda_tv
+        self._lambda_smooth = lambda_smooth
 
-        self.reconstruction_loss = CombinedReconstructionLoss(
-            l1_weight=l1_weight, ssim_weight=ssim_weight, data_range=data_range
-        )
+        if multiscale:
+            self.reconstruction_loss = MultiScaleReconstructionLoss(
+                l1_weight=l1_weight, ssim_weight=ssim_weight,
+                num_scales=3, data_range=data_range,
+            )
+        else:
+            self.reconstruction_loss = CombinedReconstructionLoss(
+                l1_weight=l1_weight, ssim_weight=ssim_weight,
+                data_range=data_range,
+            )
         self.smoothness_loss = SmoothnessLoss()
         self.edge_loss = EdgePreservationLoss()
+        self.tv_loss = TotalVariationLoss()
+
+    def set_progress(self, progress: float) -> None:
+        """Update regularization weights based on training progress.
+
+        Smoothness decays from 2x initial to 0.5x initial over training,
+        implementing coarse-to-fine refinement.
+
+        Args:
+            progress: Training progress in [0, 1].
+        """
+        # Smooth decay: 2.0 * init -> 0.5 * init over training
+        scale = 2.0 - 1.5 * min(progress, 1.0)
+        self._lambda_smooth = self.lambda_smooth_init * scale
 
     def forward(
         self,
@@ -136,24 +175,10 @@ class TotalLoss(nn.Module):
         adjacent_pred: Optional[torch.Tensor] = None,
         adjacent_target: Optional[torch.Tensor] = None,
     ) -> dict:
-        """Compute total loss with all components.
-
-        Args:
-            prediction: Predicted slice.
-            target: Ground truth slice.
-            adjacent_pred: Optional adjacent predicted slice for smoothness.
-            adjacent_target: Optional adjacent target slice.
-
-        Returns:
-            Dictionary with total loss and individual components.
-        """
-        # Reconstruction loss (always computed)
         l_rec = self.reconstruction_loss(prediction, target)
-
-        # Edge preservation loss
         l_edge = self.edge_loss(prediction, target)
+        l_tv = self.tv_loss(prediction)
 
-        # Smoothness loss (if adjacent slice available)
         l_smooth = torch.tensor(0.0, device=prediction.device)
         if adjacent_pred is not None:
             if adjacent_target is not None:
@@ -161,12 +186,15 @@ class TotalLoss(nn.Module):
             else:
                 l_smooth = self.smoothness_loss(prediction, adjacent_pred)
 
-        # Total loss
-        total = l_rec + self.lambda_smooth * l_smooth + self.lambda_edge * l_edge
+        total = (l_rec
+                 + self._lambda_smooth * l_smooth
+                 + self.lambda_edge * l_edge
+                 + self.lambda_tv * l_tv)
 
         return {
             "total": total,
             "reconstruction": l_rec,
             "smoothness": l_smooth,
             "edge": l_edge,
+            "tv": l_tv,
         }
