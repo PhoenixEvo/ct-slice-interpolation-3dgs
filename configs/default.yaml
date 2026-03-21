@@ -59,8 +59,9 @@ gaussian:
   opacity_reset_value: 0.5
 
   # Rendering
-  tile_size: 16
-  z_threshold: 3.0         # Only render Gaussians within 3*sigma_z of target
+  render_mode: "weighted"   # "weighted" (fast separable matmul) or "alpha" (compositing)
+  tile_size: 64             # Tile size for alpha-mode fallback
+  z_threshold: 3.0          # Only render Gaussians within 3*sigma_z of target
 
 # --- Losses ---
 loss:

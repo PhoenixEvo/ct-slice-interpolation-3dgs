@@ -83,13 +83,12 @@ class Trainer3DGS:
                 device=device,
             )
 
-        # Initialize Renderer
         self.renderer = SliceRenderer(
             image_height=H,
             image_width=W,
-            tile_size=gs_config.get("tile_size", 16),
+            tile_size=gs_config.get("tile_size", 64),
             z_threshold=gs_config.get("z_threshold", 3.0),
-            render_mode="alpha",
+            render_mode=gs_config.get("render_mode", "weighted"),
         ).to(device)
 
         # Initialize Loss
@@ -257,7 +256,6 @@ class Trainer3DGS:
             ]
             gt_slice = self.observed_slices[z_idx]
 
-            # Render the slice
             with autocast(enabled=self.mixed_precision):
                 params = self.gaussian_model.get_params()
                 rendered = self.renderer(
@@ -268,21 +266,21 @@ class Trainer3DGS:
                     float(z_idx),
                 )
 
-                # Get adjacent slice for smoothness regularization
+                # Smoothness regularization every 3 iterations to save render cost
                 adjacent_pred = None
                 adjacent_gt = None
-                neighbor_z = z_idx + 1 if z_idx + 1 < self.D else z_idx - 1
-                if neighbor_z in self.observed_slices:
-                    adjacent_gt = self.observed_slices[neighbor_z]
-                    adjacent_pred = self.renderer(
-                        params["positions"],
-                        params["scales"],
-                        params["opacity"],
-                        params["intensity"],
-                        float(neighbor_z),
-                    )
+                if iteration % 3 == 0:
+                    neighbor_z = z_idx + 1 if z_idx + 1 < self.D else z_idx - 1
+                    if neighbor_z in self.observed_slices:
+                        adjacent_gt = self.observed_slices[neighbor_z]
+                        adjacent_pred = self.renderer(
+                            params["positions"],
+                            params["scales"],
+                            params["opacity"],
+                            params["intensity"],
+                            float(neighbor_z),
+                        )
 
-                # Compute loss
                 loss_dict = self.criterion(
                     rendered, gt_slice, adjacent_pred, adjacent_gt
                 )
