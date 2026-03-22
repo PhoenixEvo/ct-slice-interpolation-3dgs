@@ -121,12 +121,20 @@ class GaussianVolume(nn.Module):
         """
         H, W, D = volume.shape
         n_obs = len(observed_indices)
+        original_subsample = subsample_xy
 
         # Auto-increase subsample_xy to fit within budget
         raw_count = (H // subsample_xy) * (W // subsample_xy) * n_obs
         if raw_count > max_gaussians:
             required_s = int(np.ceil(np.sqrt(H * W * n_obs / max_gaussians)))
             subsample_xy = max(subsample_xy, required_s)
+
+        # Scale init_scale_xy to maintain spatial overlap when grid is coarser.
+        # Ensure 3*sigma >= spacing so adjacent Gaussians overlap.
+        if subsample_xy > original_subsample:
+            init_scale_xy = init_scale_xy * (subsample_xy / original_subsample)
+        min_scale_xy = subsample_xy / 3.0
+        init_scale_xy = max(init_scale_xy, min_scale_xy)
 
         x_coords = np.arange(0, H, subsample_xy).astype(np.float32)
         y_coords = np.arange(0, W, subsample_xy).astype(np.float32)
@@ -139,7 +147,8 @@ class GaussianVolume(nn.Module):
 
         num_gaussians = positions.shape[0]
         print(
-            f"  Grid init: subsample_xy={subsample_xy}, "
+            f"  Grid init: subsample_xy={subsample_xy} (base={original_subsample}), "
+            f"init_scale_xy={init_scale_xy:.1f}, "
             f"{len(x_coords)}x{len(y_coords)}x{n_obs} = {num_gaussians} Gaussians"
         )
 
@@ -210,6 +219,7 @@ class GaussianVolume(nn.Module):
 
         H, W, D = volume.shape
         n_obs = len(observed_indices)
+        original_subsample = subsample_xy
 
         # Adaptive has ~2x Gaussians vs grid due to edge points
         adaptive_factor = 2.0
@@ -219,6 +229,12 @@ class GaussianVolume(nn.Module):
                 H * W * n_obs * adaptive_factor / max_gaussians
             )))
             subsample_xy = max(subsample_xy, required_s)
+
+        # Scale init_scale_xy to maintain spatial overlap
+        if subsample_xy > original_subsample:
+            init_scale_xy = init_scale_xy * (subsample_xy / original_subsample)
+        min_scale_xy = subsample_xy / 3.0
+        init_scale_xy = max(init_scale_xy, min_scale_xy)
 
         all_positions = []
         all_intensities = []
@@ -272,7 +288,8 @@ class GaussianVolume(nn.Module):
 
         num_gaussians = positions.shape[0]
         print(
-            f"  Adaptive init: subsample_xy={subsample_xy}, "
+            f"  Adaptive init: subsample_xy={subsample_xy} (base={original_subsample}), "
+            f"init_scale_xy={init_scale_xy:.1f}, "
             f"{num_gaussians} Gaussians (from {len(all_positions)} candidates)"
         )
 
@@ -377,6 +394,13 @@ class GaussianVolume(nn.Module):
                 & (self.positions.data[:, 2] < D + 5)
             )
             keep_mask = keep_mask & in_bounds
+
+            # Safety floor: never prune below 10% of current count
+            min_keep = max(1000, self.num_gaussians // 10)
+            if keep_mask.sum() < min_keep:
+                topk = torch.topk(opacity, min(min_keep, len(opacity)))
+                keep_mask = torch.zeros_like(keep_mask)
+                keep_mask[topk.indices] = True
 
             num_pruned = (~keep_mask).sum().item()
             if num_pruned > 0:

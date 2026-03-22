@@ -92,9 +92,9 @@ NB04 uses a 3-phase approach to avoid wasting GPU time if 3DGS underperforms:
 
 | Phase | Cases | Ratios | Time (T4x2) | Decision Gate |
 |-------|-------|--------|-------------|---------------|
-| 1 SCOUT | 5 | R=2 | ~3-5 min | 3DGS > cubic by 1+ dB? |
-| 2 VALIDATE | 10 | R=2, 3 | ~10-15 min | 3DGS competitive with U-Net? |
-| 3 FULL | 21 | R=2, 3, 4 | ~1-2h | Paper-ready results |
+| 1 SCOUT | 5 | R=2 | ~15-30 min | 3DGS > cubic by 1+ dB? |
+| 2 VALIDATE | 10 | R=2, 3 | ~1-2h | 3DGS competitive with U-Net? |
+| 3 FULL | 21 | R=2, 3, 4 | ~4-8h | Paper-ready results |
 
 Set `PHASE = 1` in cell 1, run all cells, check verdict. Completed cases are automatically skipped when advancing to the next phase.
 

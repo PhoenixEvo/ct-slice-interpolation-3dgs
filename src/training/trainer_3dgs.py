@@ -109,9 +109,15 @@ class Trainer3DGS:
             multiscale=loss_config.get("multiscale", True),
         ).to(device)
 
-        # Training parameters
-        self.num_iterations = gs_config.get("num_iterations", 2000)
+        # Training parameters with adaptive scaling for large volumes
+        base_iters = gs_config.get("num_iterations", 5000)
+        num_obs = len(observed_indices)
+        iter_scale = max(1.0, (num_obs / 50) ** 0.5)
+        self.num_iterations = int(base_iters * iter_scale)
         self.batch_slices = gs_config.get("batch_slices", 4)
+        if self.num_iterations != base_iters:
+            print(f"  Adaptive iterations: {base_iters} x {iter_scale:.2f} = {self.num_iterations} "
+                  f"(volume has {num_obs} observed slices)")
         self.warmup_iterations = gs_config.get("warmup_iterations", 200)
         self.densify_interval = gs_config.get("densify_interval", 100)
         self.densify_grad_threshold = gs_config.get(

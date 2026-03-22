@@ -47,7 +47,7 @@ gaussian:
   lr_scale: 0.005
   lr_opacity: 0.01
   lr_intensity: 0.01
-  num_iterations: 5000       # Standard quality; use 10000+ for high quality
+  num_iterations: 7000       # Base iterations (auto-scaled for large volumes)
   batch_slices: 4            # Observed slices per iteration (1=original, 4-8=better gradients)
   warmup_iterations: 200
 
