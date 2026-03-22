@@ -283,20 +283,22 @@ class Trainer3DGS:
 
             batch_z = np.random.choice(obs_indices_arr, B, replace=False)
 
-            with autocast(enabled=self.mixed_precision):
-                params = self.gaussian_model.get_params()
+            # Gradient accumulation: backward each slice independently
+            # to keep only 1-2 renders in GPU memory at a time.
+            # Mathematically identical to batched backward.
+            sum_loss = 0.0
+            sum_rec = 0.0
+            sum_smooth = 0.0
+            sum_edge = 0.0
+            sum_tv = 0.0
+            last_psnr = 0.0
 
-                total_loss = torch.tensor(0.0, device=self.device)
-                total_rec = torch.tensor(0.0, device=self.device)
-                total_smooth = torch.tensor(0.0, device=self.device)
-                total_edge = torch.tensor(0.0, device=self.device)
-                total_tv = torch.tensor(0.0, device=self.device)
-                last_rendered = None
-                last_gt = None
+            for z_idx in batch_z:
+                z_idx = int(z_idx)
+                gt_slice = self.observed_slices[z_idx]
 
-                for z_idx in batch_z:
-                    z_idx = int(z_idx)
-                    gt_slice = self.observed_slices[z_idx]
+                with autocast(enabled=self.mixed_precision):
+                    params = self.gaussian_model.get_params()
                     rendered = self.renderer(
                         params["positions"],
                         params["scales"],
@@ -322,51 +324,47 @@ class Trainer3DGS:
                     loss_dict = self.criterion(
                         rendered, gt_slice, adjacent_pred, adjacent_gt
                     )
-                    total_loss = total_loss + loss_dict["total"]
-                    total_rec = total_rec + loss_dict["reconstruction"]
-                    total_smooth = total_smooth + loss_dict["smoothness"]
-                    total_edge = total_edge + loss_dict["edge"]
-                    total_tv = total_tv + loss_dict["tv"]
-                    last_rendered = rendered
-                    last_gt = gt_slice
+                    slice_loss = loss_dict["total"] / B
 
-                loss = total_loss / B
+                if slice_loss.grad_fn is not None:
+                    self.scaler.scale(slice_loss).backward()
 
-            if loss.grad_fn is None:
-                # Safety: skip iteration if grad graph is broken
-                # (can happen when all Gaussians are pruned from a z-region)
-                continue
+                # Detach scalars for logging (frees the computation graph)
+                sum_loss += loss_dict["total"].item()
+                sum_rec += loss_dict["reconstruction"].item()
+                sum_smooth += loss_dict["smoothness"].item()
+                sum_edge += loss_dict["edge"].item()
+                sum_tv += loss_dict["tv"].item()
 
-            self.scaler.scale(loss).backward()
+                with torch.no_grad():
+                    mse_i = ((rendered - gt_slice) ** 2).mean().item()
+                    last_psnr = 10 * np.log10(1.0 / max(mse_i, 1e-10))
+
             self.gaussian_model.accumulate_gradients()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
             if iteration % self.log_interval == 0:
-                with torch.no_grad():
-                    mse = ((last_rendered - last_gt) ** 2).mean().item()
-                    psnr = 10 * np.log10(1.0 / max(mse, 1e-10))
-
                 cur_lr = self._get_position_lr(iteration)
                 self.history["iteration"].append(iteration)
-                self.history["loss_total"].append((total_loss / B).item())
-                self.history["loss_rec"].append((total_rec / B).item())
-                self.history["loss_smooth"].append((total_smooth / B).item())
-                self.history["loss_edge"].append((total_edge / B).item())
-                self.history["loss_tv"].append((total_tv / B).item())
+                self.history["loss_total"].append(sum_loss / B)
+                self.history["loss_rec"].append(sum_rec / B)
+                self.history["loss_smooth"].append(sum_smooth / B)
+                self.history["loss_edge"].append(sum_edge / B)
+                self.history["loss_tv"].append(sum_tv / B)
                 self.history["num_gaussians"].append(
                     self.gaussian_model.num_gaussians
                 )
-                self.history["psnr_train"].append(psnr)
+                self.history["psnr_train"].append(last_psnr)
                 self.history["lr_position"].append(cur_lr)
 
                 if iteration % (self.log_interval * 4) == 0:
                     elapsed = time.time() - t_start
                     print(
                         f"Iter {iteration}/{self.num_iterations} | "
-                        f"Loss: {(total_loss / B).item():.6f} | "
-                        f"Rec: {(total_rec / B).item():.6f} | "
-                        f"PSNR: {psnr:.2f} dB | "
+                        f"Loss: {sum_loss / B:.6f} | "
+                        f"Rec: {sum_rec / B:.6f} | "
+                        f"PSNR: {last_psnr:.2f} dB | "
                         f"#GS: {self.gaussian_model.num_gaussians} | "
                         f"LR_pos: {cur_lr:.6f} | "
                         f"Time: {elapsed:.1f}s"
@@ -391,6 +389,8 @@ class Trainer3DGS:
                     max_gaussians=self.max_gaussians,
                 )
                 self._rebuild_optimizer()
+                if self.device != "cpu":
+                    torch.cuda.empty_cache()
 
                 if stats["cloned"] > 0 or stats["pruned"] > 0:
                     print(
@@ -459,7 +459,10 @@ class Trainer3DGS:
 
             stacked = torch.stack(batch_rendered, dim=0).cpu().numpy()
             results[:, :, start:end] = stacked.transpose(1, 2, 0)
+            del batch_rendered, stacked
 
+        if self.device != "cpu":
+            torch.cuda.empty_cache()
         return results
 
     @torch.no_grad()
