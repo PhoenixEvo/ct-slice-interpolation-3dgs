@@ -83,10 +83,11 @@ class SliceRenderer(nn.Module):
         z_mask = torch.abs(z_dist) < self.z_threshold
 
         if z_mask.sum() == 0:
-            return torch.zeros(
-                1, self.H, self.W,
-                device=positions.device, dtype=positions.dtype
-            )
+            # Maintain gradient flow so backward() does not crash.
+            # The zero-valued anchor contributes 0 gradient to parameters.
+            grad_anchor = (positions.sum() + scales.sum()
+                           + opacity.sum() + intensity.sum()) * 0.0
+            return grad_anchor.reshape(1, 1, 1).expand(1, self.H, self.W)
 
         pos_active = positions[z_mask]
         scale_active = scales[z_mask]

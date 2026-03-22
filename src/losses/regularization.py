@@ -179,12 +179,14 @@ class TotalLoss(nn.Module):
         l_edge = self.edge_loss(prediction, target)
         l_tv = self.tv_loss(prediction)
 
-        l_smooth = torch.tensor(0.0, device=prediction.device)
         if adjacent_pred is not None:
             if adjacent_target is not None:
                 l_smooth = self.smoothness_loss(adjacent_pred, adjacent_target)
             else:
                 l_smooth = self.smoothness_loss(prediction, adjacent_pred)
+        else:
+            # Keep grad graph alive via a zero that depends on prediction
+            l_smooth = prediction.sum() * 0.0
 
         total = (l_rec
                  + self._lambda_smooth * l_smooth

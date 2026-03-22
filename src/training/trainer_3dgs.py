@@ -326,6 +326,11 @@ class Trainer3DGS:
 
                 loss = total_loss / B
 
+            if loss.grad_fn is None:
+                # Safety: skip iteration if grad graph is broken
+                # (can happen when all Gaussians are pruned from a z-region)
+                continue
+
             self.scaler.scale(loss).backward()
             self.gaussian_model.accumulate_gradients()
             self.scaler.step(self.optimizer)
