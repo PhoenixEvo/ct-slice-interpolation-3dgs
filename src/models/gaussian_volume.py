@@ -2,6 +2,8 @@
 3D Gaussian Volume representation for CT slice interpolation.
 Each Gaussian has: position (x,y,z), scale (sx,sy,sz), opacity, intensity.
 Axis-aligned (no rotation) for simplicity and efficiency.
+
+Supports both gradient-based and error-map-based densification.
 """
 
 import torch
@@ -60,6 +62,14 @@ class GaussianVolume(nn.Module):
             "grad_count", torch.zeros(num_gaussians, device=device)
         )
 
+        # Track per-Gaussian reconstruction error for error-map densification
+        self.register_buffer(
+            "error_accum", torch.zeros(num_gaussians, device=device)
+        )
+        self.register_buffer(
+            "error_count", torch.zeros(num_gaussians, device=device)
+        )
+
     @property
     def num_gaussians(self) -> int:
         """Current number of Gaussians."""
@@ -105,19 +115,6 @@ class GaussianVolume(nn.Module):
         Places Gaussians on a subsampled grid at each observed z-position,
         with intensity initialized from the CT volume. Automatically adjusts
         subsample_xy to keep total Gaussians within max_gaussians.
-
-        Args:
-            volume: Preprocessed CT volume (H, W, D), values in [0, 1].
-            observed_indices: Indices of observed slices.
-            subsample_xy: Base subsampling factor in x and y.
-            init_scale_xy: Initial scale in x and y directions.
-            init_scale_z: Initial scale in z direction.
-            init_opacity: Initial opacity (pre-sigmoid value).
-            max_gaussians: Maximum number of initial Gaussians.
-            device: Computation device.
-
-        Returns:
-            Initialized GaussianVolume instance.
         """
         H, W, D = volume.shape
         n_obs = len(observed_indices)
@@ -130,7 +127,6 @@ class GaussianVolume(nn.Module):
             subsample_xy = max(subsample_xy, required_s)
 
         # Scale init_scale_xy to maintain spatial overlap when grid is coarser.
-        # Ensure 3*sigma >= spacing so adjacent Gaussians overlap.
         if subsample_xy > original_subsample:
             init_scale_xy = init_scale_xy * (subsample_xy / original_subsample)
         min_scale_xy = subsample_xy / 3.0
@@ -143,7 +139,7 @@ class GaussianVolume(nn.Module):
         xx, yy, zz = np.meshgrid(x_coords, y_coords, z_coords, indexing="ij")
         positions = np.stack(
             [xx.ravel(), yy.ravel(), zz.ravel()], axis=-1
-        )  # (N, 3)
+        )
 
         num_gaussians = positions.shape[0]
         print(
@@ -176,9 +172,11 @@ class GaussianVolume(nn.Module):
                 torch.from_numpy(intensities).float().to(device)
             )
 
-        # Reset gradient accumulators
+        # Reset accumulators
         model.grad_accum = torch.zeros(num_gaussians, device=device)
         model.grad_count = torch.zeros(num_gaussians, device=device)
+        model.error_accum = torch.zeros(num_gaussians, device=device)
+        model.error_count = torch.zeros(num_gaussians, device=device)
 
         return model
 
@@ -195,26 +193,7 @@ class GaussianVolume(nn.Module):
         max_gaussians: int = 500000,
         device: str = "cuda",
     ) -> "GaussianVolume":
-        """Initialize Gaussians with higher density near edges.
-
-        Uses Sobel edge detection to place more Gaussians near organ
-        boundaries for better detail preservation. Auto-adjusts
-        subsample_xy to keep total within max_gaussians.
-
-        Args:
-            volume: Preprocessed CT volume (H, W, D).
-            observed_indices: Indices of observed slices.
-            subsample_xy: Base subsampling factor.
-            edge_boost: Factor to increase density near edges.
-            init_scale_xy: Initial scale in x, y.
-            init_scale_z: Initial scale in z.
-            init_opacity: Initial opacity.
-            max_gaussians: Maximum number of initial Gaussians.
-            device: Computation device.
-
-        Returns:
-            Initialized GaussianVolume with adaptive density.
-        """
+        """Initialize Gaussians with higher density near edges."""
         from scipy import ndimage
 
         H, W, D = volume.shape
@@ -312,43 +291,131 @@ class GaussianVolume(nn.Module):
 
         model.grad_accum = torch.zeros(num_gaussians, device=device)
         model.grad_count = torch.zeros(num_gaussians, device=device)
+        model.error_accum = torch.zeros(num_gaussians, device=device)
+        model.error_count = torch.zeros(num_gaussians, device=device)
 
         return model
+
+    @torch.no_grad()
+    def accumulate_errors(
+        self,
+        error_map: torch.Tensor,
+        positions: torch.Tensor,
+        scales: torch.Tensor,
+        z_target: float,
+        z_threshold: float = 3.0,
+    ) -> None:
+        """Accumulate per-pixel reconstruction error mapped back to Gaussians.
+
+        For each Gaussian within z-range of the target slice, compute its
+        weighted average error over the pixels it influences. This provides
+        a direct signal about where reconstruction quality is poor, unlike
+        gradient-based densification which has systematic bias.
+
+        Args:
+            error_map: Per-pixel L1 error (1, H, W) on the rendered slice.
+            positions: Gaussian positions (N, 3).
+            scales: Gaussian scales (N, 3).
+            z_target: Z-position of the rendered slice.
+            z_threshold: Z-distance threshold in sigma units.
+        """
+        N = positions.shape[0]
+        H, W = error_map.shape[-2], error_map.shape[-1]
+
+        # Filter Gaussians near this z-plane
+        z_dist = torch.abs(z_target - positions[:, 2]) / (scales[:, 2] + 1e-8)
+        z_mask = z_dist < z_threshold
+
+        if z_mask.sum() == 0:
+            return
+
+        active_pos = positions[z_mask]  # (K, 3)
+        active_scales = scales[z_mask]  # (K, 3)
+        active_indices = torch.where(z_mask)[0]  # (K,)
+
+        # For each active Gaussian, sample the error at its (x, y) position
+        # This is memory-efficient: just look up the error at the Gaussian center
+        x_coords = active_pos[:, 0].long().clamp(0, H - 1)
+        y_coords = active_pos[:, 1].long().clamp(0, W - 1)
+
+        # Get error at each Gaussian's center position
+        error_flat = error_map.squeeze()  # (H, W)
+        gaussian_errors = error_flat[x_coords, y_coords]  # (K,)
+
+        # Also sample errors in a small neighborhood for robustness
+        # Use 4 neighboring pixels (±1 in x and y)
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx = (x_coords + dx).clamp(0, H - 1)
+            ny = (y_coords + dy).clamp(0, W - 1)
+            gaussian_errors += error_flat[nx, ny]
+        gaussian_errors /= 5.0  # Average over center + 4 neighbors
+
+        # Accumulate
+        n_current = min(N, self.error_accum.shape[0])
+        valid = active_indices < n_current
+        if valid.any():
+            self.error_accum[active_indices[valid]] += gaussian_errors[valid]
+            self.error_count[active_indices[valid]] += 1
 
     def densify_and_prune(
         self,
         grad_threshold: float = 0.0005,
         opacity_threshold: float = 0.01,
         max_gaussians: int = 500000,
+        use_error_map: bool = False,
+        error_percentile: float = 95.0,
     ) -> Dict[str, int]:
         """Adaptive densification and pruning of Gaussians.
 
-        Clone Gaussians with large gradients and prune those with
-        low opacity, following the original 3DGS strategy.
+        Supports two modes:
+        1. Gradient-based (original 3DGS): Clone Gaussians with large gradients.
+        2. Error-map-based (new): Clone Gaussians with high reconstruction error.
 
         Args:
-            grad_threshold: Gradient threshold for densification.
+            grad_threshold: Gradient threshold for densification (mode 1).
             opacity_threshold: Opacity threshold for pruning.
             max_gaussians: Maximum allowed number of Gaussians.
+            use_error_map: If True, use error-map instead of gradient for cloning.
+            error_percentile: Percentile threshold for error-map densification.
 
         Returns:
             Dictionary with densification/pruning statistics.
         """
         stats = {"cloned": 0, "pruned": 0, "before": self.num_gaussians}
 
-        # Compute average gradient magnitude
-        avg_grad = self.grad_accum / (self.grad_count + 1e-8)
-
-        # --- Densification: clone high-gradient Gaussians ---
+        # --- Densification ---
         if self.num_gaussians < max_gaussians:
-            clone_mask = avg_grad > grad_threshold
+            if use_error_map and self.error_count.sum() > 0:
+                # Error-map based densification
+                avg_error = self.error_accum / (self.error_count + 1e-8)
+                # Only consider Gaussians that have been evaluated
+                evaluated_mask = self.error_count > 0
+                if evaluated_mask.sum() > 0:
+                    error_threshold = torch.quantile(
+                        avg_error[evaluated_mask],
+                        error_percentile / 100.0,
+                    )
+                    clone_mask = (avg_error > error_threshold) & evaluated_mask
+                else:
+                    clone_mask = torch.zeros(
+                        self.num_gaussians, dtype=torch.bool, device=self.device
+                    )
+            else:
+                # Gradient-based densification (original 3DGS)
+                avg_grad = self.grad_accum / (self.grad_count + 1e-8)
+                clone_mask = avg_grad > grad_threshold
+
             num_clone = clone_mask.sum().item()
 
             if num_clone > 0:
                 # Limit cloning to not exceed max
                 budget = max_gaussians - self.num_gaussians
                 if num_clone > budget:
-                    topk = torch.topk(avg_grad, budget)
+                    if use_error_map and self.error_count.sum() > 0:
+                        score = self.error_accum / (self.error_count + 1e-8)
+                    else:
+                        score = self.grad_accum / (self.grad_count + 1e-8)
+                    topk = torch.topk(score, budget)
                     clone_mask = torch.zeros_like(clone_mask)
                     clone_mask[topk.indices] = True
                     num_clone = budget
@@ -413,10 +480,12 @@ class GaussianVolume(nn.Module):
 
                 stats["pruned"] = num_pruned
 
-        # Reset gradient accumulators
+        # Reset accumulators
         n = self.num_gaussians
         self.grad_accum = torch.zeros(n, device=self.positions.device)
         self.grad_count = torch.zeros(n, device=self.positions.device)
+        self.error_accum = torch.zeros(n, device=self.positions.device)
+        self.error_count = torch.zeros(n, device=self.positions.device)
 
         stats["after"] = self.num_gaussians
         return stats

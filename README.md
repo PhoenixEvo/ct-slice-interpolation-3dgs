@@ -14,8 +14,10 @@ This project explores whether **3D Gaussian Splatting** -- originally developed 
 - **Separable differentiable rendering**: Exploits axis-aligned Gaussian structure for O(H·K + W·K) rendering via matrix multiplication, ~50-100x faster than naive per-pixel computation
 - **Multi-scale reconstruction loss**: Computes L1 + SSIM at 3 resolution levels (1x, 1/2x, 1/4x) for simultaneous coarse structure and fine detail learning
 - **Medical-specific regularization**: z-axis smoothness with coarse-to-fine annealing, Sobel-based edge preservation, and Total Variation loss for spatial denoising
-- **Adaptive initialization**: Gaussian z-scale automatically adjusted based on sparse ratio; spatial subsampling adapts to keep count within budget
+- **Adaptive initialization**: Gaussian z-scale automatically adjusted based on sparse ratio; spatial subsampling adapts to keep count within budget; xy-scale is auto-expanded to preserve spatial overlap under coarse subsampling
 - **Progressive densification**: Gradient threshold ramps from aggressive (0.5x) to conservative (1.5x) over training, promoting rapid coverage then fine refinement
+- **Memory-stable training**: Per-slice gradient accumulation (mathematically equivalent to mini-batch gradient) significantly reduces peak VRAM and avoids `loss.backward()` OOM on large volumes
+- **Pruning safety floor**: Prevents catastrophic collapse to zero Gaussians during late-stage pruning
 - **Comprehensive comparison** against classical interpolation (nearest/linear/cubic) and supervised U-Net 2D
 - **ROI-based evaluation**: Per-organ metrics (liver, lungs, kidneys, bladder, bone) using segmentation masks
 - **Ablation studies**: Quantifying the impact of each regularization and rendering component
@@ -32,7 +34,7 @@ TLCN/
       dataset.py             # PyTorch Datasets + LazyUNetSliceDataset + VolumeGroupedSampler
     models/
       gaussian_volume.py     # 3DGS model (position, log-scale, opacity, intensity)
-      slice_renderer.py      # Differentiable tile-based slice renderer
+      slice_renderer.py      # Differentiable renderer (separable weighted + alpha/tile fallback)
       unet2d.py              # U-Net 2D baseline
       classical_interp.py    # Nearest/linear/cubic + streaming slice-by-slice mode
     losses/
@@ -82,7 +84,7 @@ All notebooks are designed as self-contained Kaggle notebooks. Each loads raw CT
 | 01 | `01_data_preparation.ipynb` | Data exploration, volume statistics, split verification | ~5 min (CPU) |
 | 02 | `02_baseline_classical.ipynb` | Streaming slice-by-slice classical interpolation (nearest/linear/cubic) | ~30 min (CPU) |
 | 03 | `03_baseline_unet.ipynb` | U-Net 2D training + evaluation for R=2,3,4 with multi-GPU | ~8-12h total |
-| 04 | `04_3dgs_training.ipynb` | 3DGS per-volume optimization with 3-phase strategy | ~5 min - 2h |
+| 04 | `04_3dgs_training.ipynb` | 3DGS per-volume optimization with 3-phase strategy | ~15 min - 8h |
 | 05 | `05_benchmark_ablation.ipynb` | Cross-method comparison + ablation (regularization variants) | ~1-3h |
 | 06 | `06_visualization.ipynb` | Publication figures: bar charts, slice comparisons, per-organ plots | ~10 min |
 
@@ -92,9 +94,9 @@ NB04 uses a 3-phase approach to avoid wasting GPU time if 3DGS underperforms:
 
 | Phase | Cases | Ratios | Time (T4x2) | Decision Gate |
 |-------|-------|--------|-------------|---------------|
-| 1 SCOUT | 5 | R=2 | ~15-30 min | 3DGS > cubic by 1+ dB? |
-| 2 VALIDATE | 10 | R=2, 3 | ~1-2h | 3DGS competitive with U-Net? |
-| 3 FULL | 21 | R=2, 3, 4 | ~4-8h | Paper-ready results |
+| 1 SCOUT | 5 | R=2 | ~15-30 min to ~2h | 3DGS > cubic by 1+ dB? |
+| 2 VALIDATE | 10 | R=2, 3 | ~1-4h | 3DGS competitive with U-Net? |
+| 3 FULL | 21 | R=2, 3, 4 | ~4-12h | Paper-ready results |
 
 Set `PHASE = 1` in cell 1, run all cells, check verdict. Completed cases are automatically skipped when advancing to the next phase.
 
@@ -160,6 +162,12 @@ Where:
 - **Late training**: High gradient threshold (1.5× base) → conservative refinement only where needed
 - **Prune**: Low-opacity Gaussians (< 0.01) are removed
 - Max 500K Gaussians per volume (800K in high-quality mode)
+
+**Training stability and memory controls**:
+- **Per-slice gradient accumulation**: computes and backpropagates each sampled slice independently, reducing peak VRAM while preserving the same averaged gradient objective
+- **Adaptive iteration scaling**: effective iterations increase with number of observed slices, preventing under-training on long volumes
+- **Pruning floor**: enforces a minimum retained Gaussian count to avoid collapse to zero active primitives
+- **Cache hygiene**: explicit CUDA cache cleanup after densification/evaluation and between cases in notebook execution
 
 ## Dataset
 
@@ -230,6 +238,7 @@ outputs/
 - **TF32 enabled**: `torch.backends.cuda.matmul.allow_tf32 = True` for faster matrix operations
 - **cudnn.benchmark**: Auto-selects optimal convolution algorithms
 - **Async data transfer**: `tensor.to(device, non_blocking=True)` overlaps CPU-GPU transfers
+- **Gradient accumulation for memory safety**: per-slice backward avoids graph blow-up from multi-slice + multi-term losses
 
 ### Session Resume (Kaggle 30h/week GPU Quota)
 
@@ -245,9 +254,9 @@ All hyperparameters are centralized in `configs/default.yaml`:
 ```yaml
 gaussian:
   init_mode: "grid"          # or "adaptive" (edge-aware initialization)
-  num_iterations: 5000       # 10000+ for high quality
-  batch_slices: 4            # Multi-slice batch training
-  max_gaussians: 500000
+  num_iterations: 7000       # base iterations (auto-scaled for large volumes)
+  batch_slices: 4            # Multi-slice sampling with per-slice gradient accumulation
+  max_gaussians: 500000      # notebook QUALITY can override to 800k/1M
   render_mode: "weighted"    # Separable rendering via matmul
 
 loss:
@@ -263,6 +272,10 @@ unet:
   lr: 1.0e-4
   num_epochs: 50
 ```
+
+## Current Status and Limitations
+
+Current codebase emphasizes robustness and reproducibility on Kaggle constraints (memory/OOM handling, resume support, stable long-volume training). However, the latest Phase-1 comparison (R=2, shared case subset) still shows a notable PSNR/SSIM gap between 3DGS and strong interpolation/supervised baselines. In other words, the project is currently strong on engineering stability, but further method-level improvements are still required to claim state-of-the-art quantitative quality.
 
 ## Local Usage
 

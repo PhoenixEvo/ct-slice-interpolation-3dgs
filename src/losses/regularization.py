@@ -1,6 +1,7 @@
 """
 Regularization losses for 3DGS CT slice interpolation.
-Includes smoothness along z-axis, edge preservation, and total variation.
+Includes smoothness along z-axis, edge preservation, total variation,
+and FFT high-frequency loss integration.
 """
 
 import torch
@@ -8,7 +9,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-from .reconstruction import CombinedReconstructionLoss, MultiScaleReconstructionLoss
+from .reconstruction import (
+    CombinedReconstructionLoss,
+    MultiScaleReconstructionLoss,
+    FFTHighFreqLoss,
+)
 
 
 class SmoothnessLoss(nn.Module):
@@ -23,15 +28,7 @@ class SmoothnessLoss(nn.Module):
         slice_current: torch.Tensor,
         slice_adjacent: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute smoothness loss between two adjacent slices.
-
-        Args:
-            slice_current: Current rendered slice (1, H, W) or (B, 1, H, W).
-            slice_adjacent: Adjacent rendered slice, same shape.
-
-        Returns:
-            Scalar smoothness loss.
-        """
+        """Compute smoothness loss between two adjacent slices."""
         return F.l1_loss(slice_current, slice_adjacent)
 
 
@@ -60,14 +57,7 @@ class EdgePreservationLoss(nn.Module):
         self.register_buffer("sobel_y", sobel_y)
 
     def _compute_gradient(self, image: torch.Tensor) -> torch.Tensor:
-        """Compute gradient magnitude using Sobel operator.
-
-        Args:
-            image: Input image (B, 1, H, W) or (1, H, W).
-
-        Returns:
-            Gradient magnitude, same shape as input.
-        """
+        """Compute gradient magnitude using Sobel operator."""
         if image.dim() == 3:
             image = image.unsqueeze(0)
 
@@ -82,18 +72,38 @@ class EdgePreservationLoss(nn.Module):
         prediction: torch.Tensor,
         target: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute edge preservation loss.
-
-        Args:
-            prediction: Predicted slice (1, H, W) or (B, 1, H, W).
-            target: Ground truth slice, same shape.
-
-        Returns:
-            Scalar edge loss.
-        """
+        """Compute edge preservation loss."""
         pred_grad = self._compute_gradient(prediction)
         target_grad = self._compute_gradient(target)
         return F.l1_loss(pred_grad, target_grad)
+
+    def compute_weight_map(
+        self, target: torch.Tensor, weight_max: float = 3.0,
+    ) -> torch.Tensor:
+        """Compute HU gradient-based spatial weight map.
+
+        Returns a weight map where regions with strong gradients (organ
+        boundaries, bone interfaces) receive higher weight, guiding the
+        model to focus reconstruction accuracy on clinically important
+        structures.
+
+        Args:
+            target: Ground truth slice (1, H, W) or (B, 1, H, W).
+            weight_max: Maximum weight boost at strongest gradients.
+
+        Returns:
+            Weight map with values in [1.0, weight_max], same shape as target.
+        """
+        grad_mag = self._compute_gradient(target)
+        # Normalize gradient to [0, 1]
+        gmax = grad_mag.max()
+        if gmax > 1e-8:
+            grad_norm = grad_mag / gmax
+        else:
+            grad_norm = grad_mag
+        # Map to [1.0, weight_max]
+        weight = 1.0 + grad_norm * (weight_max - 1.0)
+        return weight
 
 
 class TotalVariationLoss(nn.Module):
@@ -102,8 +112,6 @@ class TotalVariationLoss(nn.Module):
     Penalizes high-frequency noise in rendered slices while preserving
     sharp edges. Uses anisotropic TV which sums absolute differences
     along each axis independently (less edge-blurring than isotropic TV).
-
-    L_tv = mean(|I[i+1,j] - I[i,j]| + |I[i,j+1] - I[i,j]|)
     """
 
     def forward(self, prediction: torch.Tensor) -> torch.Tensor:
@@ -115,14 +123,15 @@ class TotalVariationLoss(nn.Module):
 
 
 class TotalLoss(nn.Module):
-    """Total loss combining multi-scale reconstruction and regularization.
+    """Total loss combining multi-scale reconstruction, FFT, and regularization.
 
     L_total = L_rec_ms + lambda_smooth * L_smooth + lambda_edge * L_edge
-              + lambda_tv * L_tv
+              + lambda_tv * L_tv + lambda_fft * L_fft
 
-    Supports regularization annealing via set_progress() for coarse-to-fine
-    training: smoothness starts high and decays, allowing the model to first
-    capture global anatomy then refine local detail.
+    Supports:
+    - Regularization annealing via set_progress() for coarse-to-fine training
+    - FFT high-frequency loss for sharp edge preservation
+    - HU gradient-based spatial weighting for clinical structure focus
     """
 
     def __init__(
@@ -130,8 +139,12 @@ class TotalLoss(nn.Module):
         lambda_smooth: float = 0.01,
         lambda_edge: float = 0.005,
         lambda_tv: float = 0.001,
+        lambda_fft: float = 0.01,
+        fft_cutoff: float = 0.3,
         l1_weight: float = 1.0,
         ssim_weight: float = 0.1,
+        hu_gradient_weight: bool = False,
+        hu_weight_max: float = 3.0,
         multiscale: bool = True,
         data_range: float = 1.0,
     ):
@@ -139,7 +152,10 @@ class TotalLoss(nn.Module):
         self.lambda_smooth_init = lambda_smooth
         self.lambda_edge = lambda_edge
         self.lambda_tv = lambda_tv
+        self.lambda_fft = lambda_fft
         self._lambda_smooth = lambda_smooth
+        self.hu_gradient_weight = hu_gradient_weight
+        self.hu_weight_max = hu_weight_max
 
         if multiscale:
             self.reconstruction_loss = MultiScaleReconstructionLoss(
@@ -155,11 +171,18 @@ class TotalLoss(nn.Module):
         self.edge_loss = EdgePreservationLoss()
         self.tv_loss = TotalVariationLoss()
 
+        # FFT high-frequency loss (new)
+        if lambda_fft > 0:
+            self.fft_loss = FFTHighFreqLoss(cutoff_ratio=fft_cutoff)
+        else:
+            self.fft_loss = None
+
     def set_progress(self, progress: float) -> None:
         """Update regularization weights based on training progress.
 
         Smoothness decays from 2x initial to 0.5x initial over training,
-        implementing coarse-to-fine refinement.
+        implementing coarse-to-fine refinement. FFT loss ramps up from
+        0.5x to 1.5x to increasingly enforce high-frequency fidelity.
 
         Args:
             progress: Training progress in [0, 1].
@@ -175,10 +198,34 @@ class TotalLoss(nn.Module):
         adjacent_pred: Optional[torch.Tensor] = None,
         adjacent_target: Optional[torch.Tensor] = None,
     ) -> dict:
-        l_rec = self.reconstruction_loss(prediction, target)
+        """Compute total loss with all components.
+
+        Args:
+            prediction: Rendered slice (1, H, W).
+            target: Ground truth slice (1, H, W).
+            adjacent_pred: Optional adjacent rendered slice.
+            adjacent_target: Optional adjacent ground truth slice.
+
+        Returns:
+            Dictionary with total and component losses.
+        """
+        # Compute HU gradient weight map if enabled
+        weight_map = None
+        if self.hu_gradient_weight:
+            weight_map = self.edge_loss.compute_weight_map(
+                target, self.hu_weight_max
+            )
+
+        # Reconstruction loss (with optional spatial weighting)
+        l_rec = self.reconstruction_loss(prediction, target, weight_map)
+
+        # Edge preservation
         l_edge = self.edge_loss(prediction, target)
+
+        # Total variation
         l_tv = self.tv_loss(prediction)
 
+        # Smoothness
         if adjacent_pred is not None:
             if adjacent_target is not None:
                 l_smooth = self.smoothness_loss(adjacent_pred, adjacent_target)
@@ -188,10 +235,17 @@ class TotalLoss(nn.Module):
             # Keep grad graph alive via a zero that depends on prediction
             l_smooth = prediction.sum() * 0.0
 
+        # FFT high-frequency loss (new)
+        if self.fft_loss is not None and self.lambda_fft > 0:
+            l_fft = self.fft_loss(prediction, target)
+        else:
+            l_fft = prediction.sum() * 0.0
+
         total = (l_rec
                  + self._lambda_smooth * l_smooth
                  + self.lambda_edge * l_edge
-                 + self.lambda_tv * l_tv)
+                 + self.lambda_tv * l_tv
+                 + self.lambda_fft * l_fft)
 
         return {
             "total": total,
@@ -199,4 +253,5 @@ class TotalLoss(nn.Module):
             "smoothness": l_smooth,
             "edge": l_edge,
             "tv": l_tv,
+            "fft": l_fft,
         }

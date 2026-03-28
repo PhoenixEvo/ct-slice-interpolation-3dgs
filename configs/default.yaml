@@ -40,13 +40,17 @@ gaussian:
   init_scale_z: 1.0        # Initial scale in z (slices)
   init_opacity: 0.8        # Initial opacity (before sigmoid)
 
+  # Residual learning (NEW)
+  residual_mode: true       # Enable residual learning (3DGS predicts residual on top of cubic)
+  residual_base: "cubic"    # Base interpolation: "cubic" or "linear"
+
   # Optimization
   lr_position: 0.01
   lr_position_final: 0.0001  # Final position LR (exponential decay)
   lr_decay_start: 0          # Iteration to start LR decay
   lr_scale: 0.005
   lr_opacity: 0.01
-  lr_intensity: 0.01
+  lr_intensity: 0.005        # Reduced for residual mode (smaller target magnitude)
   num_iterations: 7000       # Base iterations (auto-scaled for large volumes)
   batch_slices: 4            # Observed slices per iteration (1=original, 4-8=better gradients)
   warmup_iterations: 200
@@ -54,6 +58,8 @@ gaussian:
   # Densification & pruning
   densify_interval: 100
   densify_grad_threshold: 0.0005
+  densify_use_error_map: true   # NEW: Use per-pixel error map instead of gradient norm
+  densify_error_percentile: 95  # NEW: Densify top 5% error Gaussians
   prune_opacity_threshold: 0.01
   max_gaussians: 500000
   opacity_reset_interval: 500  # Reset opacity periodically (0=disabled)
@@ -71,6 +77,10 @@ loss:
   lambda_smooth: 0.01       # z-axis smoothness (annealed: 2x -> 0.5x during training)
   lambda_edge: 0.005        # Sobel gradient matching
   lambda_tv: 0.001          # Total variation for spatial denoising
+  lambda_fft: 0.01          # NEW: FFT high-frequency loss weight
+  fft_cutoff: 0.3           # NEW: FFT cutoff ratio (keep freqs above this fraction)
+  hu_gradient_weight: true  # NEW: Weight loss by HU gradient magnitude
+  hu_weight_max: 3.0        # NEW: Max weight boost at strong edges
   multiscale: true           # Multi-scale reconstruction loss (1x, 1/2x, 1/4x)
 
 # --- Evaluation ---
