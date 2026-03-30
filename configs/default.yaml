@@ -45,12 +45,12 @@ gaussian:
   residual_base: "cubic"    # Base interpolation: "cubic" or "linear"
 
   # Optimization
-  lr_position: 0.01
+  lr_position: 0.005         # Slightly lower position LR for stability in residual mode
   lr_position_final: 0.0001  # Final position LR (exponential decay)
   lr_decay_start: 0          # Iteration to start LR decay
   lr_scale: 0.005
   lr_opacity: 0.01
-  lr_intensity: 0.005        # Reduced for residual mode (smaller target magnitude)
+  lr_intensity: 0.02         # Higher LR for intensity — residual targets are small but must converge fast
   num_iterations: 7000       # Base iterations (auto-scaled for large volumes)
   batch_slices: 4            # Observed slices per iteration (1=original, 4-8=better gradients)
   warmup_iterations: 200
@@ -73,14 +73,15 @@ gaussian:
 # --- Losses ---
 loss:
   l1_weight: 1.0
-  ssim_weight: 0.1
-  lambda_smooth: 0.01       # z-axis smoothness (annealed: 2x -> 0.5x during training)
-  lambda_edge: 0.005        # Sobel gradient matching
-  lambda_tv: 0.001          # Total variation for spatial denoising
-  lambda_fft: 0.01          # NEW: FFT high-frequency loss weight
-  fft_cutoff: 0.3           # NEW: FFT cutoff ratio (keep freqs above this fraction)
-  hu_gradient_weight: true  # NEW: Weight loss by HU gradient magnitude
-  hu_weight_max: 3.0        # NEW: Max weight boost at strong edges
+  ssim_weight: 0.0           # SSIM disabled for residual mode (near-zero residuals make SSIM meaningless)
+  lambda_smooth: 0.002       # Reduced for residual mode (residual magnitude ~10x smaller)
+  lambda_edge: 0.001         # Reduced for residual mode
+  lambda_tv: 0.0002          # Reduced for residual mode
+  lambda_fft: 0.05           # Increased: key signal for residual learning (high-freq detail)
+  fft_cutoff: 0.25           # Slightly lower cutoff to capture more frequency detail
+  lambda_residual: 0.1       # L2 penalty on raw 3DGS residual output (prevents artifacts)
+  hu_gradient_weight: true   # Weight loss by HU gradient magnitude
+  hu_weight_max: 5.0         # Increased: stronger focus on organ boundaries
   multiscale: true           # Multi-scale reconstruction loss (1x, 1/2x, 1/4x)
 
 # --- Evaluation ---

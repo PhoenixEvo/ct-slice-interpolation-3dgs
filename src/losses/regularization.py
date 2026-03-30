@@ -141,6 +141,7 @@ class TotalLoss(nn.Module):
         lambda_tv: float = 0.001,
         lambda_fft: float = 0.01,
         fft_cutoff: float = 0.3,
+        lambda_residual: float = 0.0,
         l1_weight: float = 1.0,
         ssim_weight: float = 0.1,
         hu_gradient_weight: bool = False,
@@ -153,6 +154,7 @@ class TotalLoss(nn.Module):
         self.lambda_edge = lambda_edge
         self.lambda_tv = lambda_tv
         self.lambda_fft = lambda_fft
+        self.lambda_residual = lambda_residual
         self._lambda_smooth = lambda_smooth
         self.hu_gradient_weight = hu_gradient_weight
         self.hu_weight_max = hu_weight_max
@@ -197,14 +199,18 @@ class TotalLoss(nn.Module):
         target: torch.Tensor,
         adjacent_pred: Optional[torch.Tensor] = None,
         adjacent_target: Optional[torch.Tensor] = None,
+        residual_output: Optional[torch.Tensor] = None,
     ) -> dict:
         """Compute total loss with all components.
 
         Args:
-            prediction: Rendered slice (1, H, W).
+            prediction: Final predicted slice (1, H, W). In residual mode,
+                        this is (cubic_base + 3dgs_output).
             target: Ground truth slice (1, H, W).
             adjacent_pred: Optional adjacent rendered slice.
             adjacent_target: Optional adjacent ground truth slice.
+            residual_output: Optional raw 3DGS output (before adding base).
+                            Used for residual magnitude penalty.
 
         Returns:
             Dictionary with total and component losses.
@@ -232,20 +238,27 @@ class TotalLoss(nn.Module):
             else:
                 l_smooth = self.smoothness_loss(prediction, adjacent_pred)
         else:
-            # Keep grad graph alive via a zero that depends on prediction
             l_smooth = prediction.sum() * 0.0
 
-        # FFT high-frequency loss (new)
+        # FFT high-frequency loss
         if self.fft_loss is not None and self.lambda_fft > 0:
             l_fft = self.fft_loss(prediction, target)
         else:
             l_fft = prediction.sum() * 0.0
 
+        # Residual magnitude penalty (L2): push raw 3DGS output towards zero
+        # This prevents artifacts from noisy residuals at target positions
+        if residual_output is not None and self.lambda_residual > 0:
+            l_residual = (residual_output ** 2).mean()
+        else:
+            l_residual = prediction.sum() * 0.0
+
         total = (l_rec
                  + self._lambda_smooth * l_smooth
                  + self.lambda_edge * l_edge
                  + self.lambda_tv * l_tv
-                 + self.lambda_fft * l_fft)
+                 + self.lambda_fft * l_fft
+                 + self.lambda_residual * l_residual)
 
         return {
             "total": total,
@@ -254,4 +267,5 @@ class TotalLoss(nn.Module):
             "edge": l_edge,
             "tv": l_tv,
             "fft": l_fft,
+            "residual": l_residual,
         }

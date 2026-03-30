@@ -131,6 +131,7 @@ class Trainer3DGS:
             lambda_tv=loss_config.get("lambda_tv", 0.001),
             lambda_fft=loss_config.get("lambda_fft", 0.0),
             fft_cutoff=loss_config.get("fft_cutoff", 0.3),
+            lambda_residual=loss_config.get("lambda_residual", 0.0),
             l1_weight=loss_config.get("l1_weight", 1.0),
             ssim_weight=loss_config.get("ssim_weight", 0.1),
             hu_gradient_weight=loss_config.get("hu_gradient_weight", False),
@@ -192,12 +193,12 @@ class Trainer3DGS:
         if self.residual_mode:
             self._precompute_residual_base()
 
-        # For residual mode: also init Gaussian intensities to near-zero
-        # since we want to predict small residuals, not full intensities
+        # For residual mode: initialize Gaussian intensities to zero
+        # since we want the initial 3DGS output to be zero (pure cubic base)
         if self.residual_mode:
             with torch.no_grad():
-                self.gaussian_model.intensity.data *= 0.1
-                print(f"  Residual mode: scaled initial intensities by 0.1")
+                self.gaussian_model.intensity.data.zero_()
+                print(f"  Residual mode: initialized intensities to zero")
 
         # Training history
         self.history = {
@@ -214,45 +215,30 @@ class Trainer3DGS:
         }
 
     def _precompute_residual_base(self) -> None:
-        """Precompute cubic/linear interpolation for all observed slices.
+        """Precompute cubic/linear interpolation for all slices.
 
-        For each observed slice z_idx, compute what the base interpolation
-        method would predict. The residual target is then (gt - base).
+        Uses ALL observed slices as control points for consistency between
+        training and inference. For observed slices, the base prediction
+        will differ from GT — the difference is the residual target.
 
-        This also precomputes base predictions for all TARGET slices
-        (needed at inference time).
+        Note: We use the SAME observed set for both training and target
+        base computation. This eliminates the train/inference mismatch
+        that occurred with leave-one-out, where training saw a different
+        (worse) base than inference saw.
         """
         method = self.residual_base
-        print(f"  Precomputing {method} base for {len(self.observed_indices)} observed "
-              f"+ {len(self.target_indices)} target slices...")
+        sorted_obs = np.sort(self.observed_indices)
+
+        # Collect all z-indices that need base computation
+        all_z = set(int(z) for z in self.observed_indices)
+        all_z.update(int(z) for z in self.target_indices)
+
+        print(f"  Precomputing {method} base for {len(all_z)} slices "
+              f"(using {len(sorted_obs)} observed as control points)...")
 
         t_start = time.time()
 
-        # For observed slices: compute leave-one-out base prediction
-        # (what would the base method predict for this slice if it were missing?)
-        sorted_obs = np.sort(self.observed_indices)
-
-        for z_idx in self.observed_indices:
-            z_idx = int(z_idx)
-            # Leave-one-out: remove this slice from observed set
-            obs_without = sorted_obs[sorted_obs != z_idx]
-            if len(obs_without) < 2:
-                # Can't interpolate with < 2 points, use zero base
-                self.cubic_cache[z_idx] = torch.zeros(
-                    1, self.H, self.W, device=self.device
-                )
-                continue
-
-            base_slice = ClassicalInterpolator.interpolate_target_slice(
-                self.volume, obs_without, z_idx, method
-            )
-            self.cubic_cache[z_idx] = torch.from_numpy(
-                base_slice
-            ).unsqueeze(0).float().to(self.device, non_blocking=True)
-
-        # For target slices: compute base prediction using all observed slices
-        for z_idx in self.target_indices:
-            z_idx = int(z_idx)
+        for z_idx in sorted(all_z):
             base_slice = ClassicalInterpolator.interpolate_target_slice(
                 self.volume, sorted_obs, z_idx, method
             )
@@ -265,6 +251,18 @@ class Trainer3DGS:
 
         elapsed = time.time() - t_start
         print(f"  Precomputed {len(self.cubic_cache)} base slices in {elapsed:.1f}s")
+
+        # Log residual statistics for debugging
+        residual_mags = []
+        for z_idx in self.observed_indices:
+            z_idx = int(z_idx)
+            gt = self.observed_slices[z_idx]
+            base = self.cubic_cache[z_idx]
+            residual = (gt - base).abs().mean().item()
+            residual_mags.append(residual)
+        avg_res = np.mean(residual_mags)
+        max_res = np.max(residual_mags)
+        print(f"  Residual stats: mean_abs={avg_res:.6f}, max_abs={max_res:.6f}")
 
     @staticmethod
     def _infer_sparse_ratio(observed_indices: np.ndarray) -> int:
@@ -354,8 +352,10 @@ class Trainer3DGS:
     def _get_training_target(self, z_idx: int) -> torch.Tensor:
         """Get the training target for a given slice index.
 
-        In standard mode: returns the ground truth slice.
-        In residual mode: returns (gt - cubic_base), the residual.
+        Always returns the ground truth slice. In residual mode, the
+        loss is computed on the FULL prediction (base + residual) vs GT,
+        not on residual vs residual_target. This gives better gradient
+        signal and avoids issues where observed slices have zero residual.
 
         Args:
             z_idx: Slice index.
@@ -363,12 +363,7 @@ class Trainer3DGS:
         Returns:
             Training target tensor (1, H, W).
         """
-        gt_slice = self.observed_slices[z_idx]
-        if self.residual_mode and z_idx in self.cubic_cache:
-            # Target is the residual = gt - base
-            residual_target = gt_slice - self.cubic_cache[z_idx]
-            return residual_target
-        return gt_slice
+        return self.observed_slices[z_idx]
 
     def _compose_prediction(
         self, rendered: torch.Tensor, z_idx: int
@@ -429,12 +424,7 @@ class Trainer3DGS:
 
             for z_idx in batch_z:
                 z_idx = int(z_idx)
-
-                # Get training target (gt or residual)
-                if self.residual_mode:
-                    train_target = self._get_training_target(z_idx)
-                else:
-                    train_target = self.observed_slices[z_idx]
+                gt_slice = self._get_training_target(z_idx)
 
                 with autocast(enabled=self.mixed_precision):
                     params = self.gaussian_model.get_params()
@@ -446,25 +436,33 @@ class Trainer3DGS:
                         float(z_idx),
                     )
 
+                    # In residual mode: compose full prediction for loss
+                    if self.residual_mode:
+                        prediction = self._compose_prediction(rendered, z_idx)
+                    else:
+                        prediction = rendered
+
                     adjacent_pred = None
                     adjacent_gt = None
                     if iteration % 3 == 0:
                         neighbor_z = z_idx + 1 if z_idx + 1 < self.D else z_idx - 1
                         if neighbor_z in self.observed_slices:
-                            if self.residual_mode:
-                                adjacent_gt = self._get_training_target(neighbor_z)
-                            else:
-                                adjacent_gt = self.observed_slices[neighbor_z]
-                            adjacent_pred = self.renderer(
+                            adjacent_gt = self.observed_slices[neighbor_z]
+                            adj_rendered = self.renderer(
                                 params["positions"],
                                 params["scales"],
                                 params["opacity"],
                                 params["intensity"],
                                 float(neighbor_z),
                             )
+                            if self.residual_mode:
+                                adjacent_pred = self._compose_prediction(adj_rendered, neighbor_z)
+                            else:
+                                adjacent_pred = adj_rendered
 
                     loss_dict = self.criterion(
-                        rendered, train_target, adjacent_pred, adjacent_gt
+                        prediction, gt_slice, adjacent_pred, adjacent_gt,
+                        residual_output=rendered if self.residual_mode else None,
                     )
                     slice_loss = loss_dict["total"] / B
 
@@ -482,7 +480,7 @@ class Trainer3DGS:
                 # Track error for error-map densification
                 if self.use_error_map:
                     with torch.no_grad():
-                        error_map = torch.abs(rendered.detach() - train_target.detach())
+                        error_map = torch.abs(prediction.detach() - gt_slice.detach())
                         self.gaussian_model.accumulate_errors(
                             error_map,
                             params["positions"].detach(),
@@ -490,14 +488,9 @@ class Trainer3DGS:
                             float(z_idx),
                         )
 
-                # PSNR computation: use full prediction (with base) for meaningful metric
+                # PSNR computation on full prediction
                 with torch.no_grad():
-                    if self.residual_mode:
-                        full_pred = self._compose_prediction(rendered, z_idx)
-                        gt_full = self.observed_slices[z_idx]
-                        mse_i = ((full_pred - gt_full) ** 2).mean().item()
-                    else:
-                        mse_i = ((rendered - train_target) ** 2).mean().item()
+                    mse_i = ((prediction.detach() - gt_slice.detach()) ** 2).mean().item()
                     last_psnr = 10 * np.log10(1.0 / max(mse_i, 1e-10))
 
             self.gaussian_model.accumulate_gradients()
