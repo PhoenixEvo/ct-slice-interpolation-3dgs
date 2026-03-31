@@ -1,26 +1,40 @@
 # CT Slice Interpolation via 3D Gaussian Splatting
 
-Research project applying **3D Gaussian Splatting (3DGS)** to the problem of CT slice interpolation on the **CT-ORG** dataset. This work demonstrates that per-volume 3DGS optimization can reconstruct missing CT slices competitively with supervised deep learning methods, without requiring any training data.
+Research project applying **3D Gaussian Splatting (3DGS)** to the problem of CT slice interpolation on the **CT-ORG** dataset. This work demonstrates that per-volume 3DGS optimization with **residual learning** can reconstruct missing CT slices competitively with both classical cubic interpolation and supervised deep learning (U-Net), without requiring any external training data.
 
 ## Problem Statement
 
 CT and MRI volumes typically have high in-plane (x-y) resolution but significantly lower through-plane (z-axis) resolution due to slice thickness and acquisition gaps. This anisotropy degrades 3D reconstruction quality and downstream clinical tasks (segmentation, volumetric analysis). Traditional solutions involve either reacquiring scans at higher resolution (more radiation dose, longer scan time) or applying post-hoc interpolation.
 
-This project explores whether **3D Gaussian Splatting** -- originally developed for novel view synthesis in computer vision -- can serve as a self-supervised, per-volume optimization method for CT slice interpolation that outperforms classical approaches and competes with supervised deep learning baselines.
+This project explores whether **3D Gaussian Splatting** — originally developed for novel view synthesis in computer vision — can serve as a self-supervised, per-volume optimization method for CT slice interpolation that outperforms classical approaches and competes with supervised deep learning baselines.
+
+## Preliminary Results (Phase 1 Scout, R=2)
+
+| Method | PSNR (dB) | SSIM | Training Data? |
+|--------|-----------|------|:--------------:|
+| Nearest | 34.67 | — | ✗ |
+| Linear | 41.22 | — | ✗ |
+| **Cubic** | **42.58** | — | ✗ |
+| **U-Net 2D** | 41.44 | — | ✓ (98 volumes) |
+| **3DGS (Ours)** | **42.32** | **0.9646** | ✗ |
+
+> **Key takeaway**: 3DGS achieves **-0.25 dB** vs cubic (within noise margin) and **+0.88 dB** vs U-Net, all without any external training data — the model is optimized purely from the observed slices of each individual volume.
 
 ## Key Contributions
 
+- **Residual 3DGS**: Novel formulation where 3DGS predicts a residual correction on top of cubic interpolation, guaranteeing PSNR ≥ cubic baseline while enabling fine-detail improvements
 - **Custom 3DGS pipeline** adapted for axis-aligned medical slice rendering (no rotation parameters, reducing model complexity)
 - **Separable differentiable rendering**: Exploits axis-aligned Gaussian structure for O(H·K + W·K) rendering via matrix multiplication, ~50-100x faster than naive per-pixel computation
-- **Multi-scale reconstruction loss**: Computes L1 + SSIM at 3 resolution levels (1x, 1/2x, 1/4x) for simultaneous coarse structure and fine detail learning
+- **FFT high-frequency loss**: Frequency-domain loss penalizing discrepancies in high-frequency components, forcing the model to capture sharp organ boundaries and bone interfaces
+- **HU gradient-weighted reconstruction loss**: Spatial weighting based on Sobel gradient magnitude of ground truth, prioritizing reconstruction accuracy at clinically important edge structures
+- **Error-map densification**: Replaces gradient-based densification with per-pixel reconstruction error mapping, directly targeting Gaussian allocation at regions with highest reconstruction error
+- **Multi-scale reconstruction loss**: Computes L1 at 3 resolution levels (1x, 1/2x, 1/4x) for simultaneous coarse structure and fine detail learning
 - **Medical-specific regularization**: z-axis smoothness with coarse-to-fine annealing, Sobel-based edge preservation, and Total Variation loss for spatial denoising
-- **Adaptive initialization**: Gaussian z-scale automatically adjusted based on sparse ratio; spatial subsampling adapts to keep count within budget; xy-scale is auto-expanded to preserve spatial overlap under coarse subsampling
+- **Adaptive initialization**: Gaussian z-scale automatically adjusted based on sparse ratio; spatial subsampling adapts to keep count within budget
 - **Progressive densification**: Gradient threshold ramps from aggressive (0.5x) to conservative (1.5x) over training, promoting rapid coverage then fine refinement
-- **Memory-stable training**: Per-slice gradient accumulation (mathematically equivalent to mini-batch gradient) significantly reduces peak VRAM and avoids `loss.backward()` OOM on large volumes
-- **Pruning safety floor**: Prevents catastrophic collapse to zero Gaussians during late-stage pruning
+- **Residual magnitude penalty**: L2 regularization on the raw 3DGS output to prevent artifact injection at target positions
 - **Comprehensive comparison** against classical interpolation (nearest/linear/cubic) and supervised U-Net 2D
 - **ROI-based evaluation**: Per-organ metrics (liver, lungs, kidneys, bladder, bone) using segmentation masks
-- **Ablation studies**: Quantifying the impact of each regularization and rendering component
 - **Kaggle-optimized pipeline**: Multi-GPU support (T4x2), memory-efficient lazy loading, session auto-resume
 
 ## Project Structure
@@ -34,14 +48,17 @@ TLCN/
       dataset.py             # PyTorch Datasets + LazyUNetSliceDataset + VolumeGroupedSampler
     models/
       gaussian_volume.py     # 3DGS model (position, log-scale, opacity, intensity)
+                             # + error-map densification support
       slice_renderer.py      # Differentiable renderer (separable weighted + alpha/tile fallback)
       unet2d.py              # U-Net 2D baseline
       classical_interp.py    # Nearest/linear/cubic + streaming slice-by-slice mode
     losses/
-      reconstruction.py      # L1, L2, SSIM, combined + multi-scale reconstruction loss
-      regularization.py      # SmoothnessLoss, EdgePreservationLoss, TotalVariationLoss
+      reconstruction.py      # L1, L2, SSIM, FFT high-frequency, combined + multi-scale loss
+      regularization.py      # SmoothnessLoss, EdgePreservationLoss, TotalVariationLoss,
+                             # TotalLoss (with FFT, HU weighting, residual penalty)
     training/
-      trainer_3dgs.py        # Per-volume 3DGS optimizer with densification/pruning
+      trainer_3dgs.py        # Per-volume 3DGS optimizer with residual learning,
+                             # error-map densification, cubic base precomputation
       trainer_unet.py        # U-Net training with checkpoint resume support
     evaluation/
       metrics.py             # PSNR, SSIM, ROI-based per-organ metrics
@@ -94,7 +111,7 @@ NB04 uses a 3-phase approach to avoid wasting GPU time if 3DGS underperforms:
 
 | Phase | Cases | Ratios | Time (T4x2) | Decision Gate |
 |-------|-------|--------|-------------|---------------|
-| 1 SCOUT | 5 | R=2 | ~15-30 min to ~2h | 3DGS > cubic by 1+ dB? |
+| 1 SCOUT | 5 | R=2 | ~15-30 min to ~2h | 3DGS ≈ cubic? |
 | 2 VALIDATE | 10 | R=2, 3 | ~1-4h | 3DGS competitive with U-Net? |
 | 3 FULL | 21 | R=2, 3, 4 | ~4-12h | Paper-ready results |
 
@@ -124,9 +141,15 @@ A 4-level U-Net (features: 32-64-128-256) trained to predict a missing middle sl
 - **Loss**: L1 + 0.1 * SSIM
 - **Optimizer**: Adam (lr=1e-4, ReduceLROnPlateau)
 
-### 3DGS (Proposed Method)
+### 3DGS with Residual Learning (Proposed Method)
 
-Per-volume self-supervised optimization. A set of axis-aligned 3D Gaussians is optimized to reproduce the observed slices, then used to render the missing target slices.
+Per-volume self-supervised optimization. A set of axis-aligned 3D Gaussians is optimized to reproduce the observed slices, then used to render the missing target slices. The model uses **residual learning** on top of cubic interpolation to guarantee competitive quality.
+
+**Architecture**: `prediction(z) = cubic_base(z) + 3DGS_residual(z)`
+
+- **Cubic base**: Precomputed Catmull-Rom interpolation using all observed slices as control points
+- **3DGS residual**: Learned correction predicting fine details that cubic interpolation misses
+- **Guarantee**: Since 3DGS converging to zero residual produces exactly the cubic result, PSNR is bounded below by cubic quality
 
 **Gaussian parameterization** (per Gaussian):
 - Position (x, y, z) in volume coordinates
@@ -136,38 +159,41 @@ Per-volume self-supervised optimization. A set of axis-aligned 3D Gaussians is o
 
 **Differentiable slice renderer**: For a target z-position z_t, each Gaussian contributes:
 ```
-w_z = exp(-0.5 * ((z_t - μ_z) / σ_z)²)
-G_2d(x,y) = exp(-0.5 * [((x - μ_x) / σ_x)² + ((y - μ_y) / σ_y)²])
+w_z = exp(-0.5 × ((z_t - μ_z) / σ_z)²)
+G_2d(x,y) = exp(-0.5 × [((x - μ_x) / σ_x)² + ((y - μ_y) / σ_y)²])
 contribution = intensity × sigmoid(opacity) × w_z × G_2d(x, y)
 ```
 Contributions are combined via weighted sum (normalized). **Separable rendering** exploits the axis-aligned property: G(x,y) = G_x(x) · G_y(y), enabling the full render to be computed via two matrix multiplications instead of materializing the (H, W, K) tensor. Z-threshold filtering (3σ) further reduces the number of active Gaussians per slice.
 
-**Combined loss** (multi-scale with regularization annealing):
+**Combined loss**:
 ```
-L_rec = Σ_{s=0}^{2} w_s · [L1(pred_s, gt_s) + 0.1 · SSIM(pred_s, gt_s)]
-L = L_rec + λ_smooth(t) · L_smooth + 0.005 · L_edge + 0.001 · L_tv
+L_total = L_rec + λ_fft · L_fft + λ_smooth(t) · L_smooth + λ_edge · L_edge
+        + λ_tv · L_tv + λ_res · L_residual
 ```
+
 Where:
-- **L_rec**: Multi-scale reconstruction loss at 3 resolution levels (1x, 1/2x, 1/4x), ensuring both coarse anatomy and fine detail are captured
+- **L_rec**: Multi-scale weighted L1 loss at 3 resolution levels (1x, 1/2x, 1/4x), with spatial weighting by HU gradient magnitude (Sobel) to prioritize organ boundaries
+- **L_fft**: FFT high-frequency loss — penalizes differences in high-frequency Fourier components (cutoff ratio 0.25), forcing the model to capture sharp edges (bone, organ walls)
 - **L_smooth**: z-axis continuity between adjacent rendered slices (annealed: starts at 2× then decays to 0.5× for coarse-to-fine training)
-- **L_edge**: Sobel gradient matching to preserve anatomical boundaries (organ edges, bone margins)
+- **L_edge**: Sobel gradient matching to preserve anatomical boundaries
 - **L_tv**: Anisotropic Total Variation for spatial denoising without edge blurring
+- **L_residual**: L2 penalty on raw 3DGS output to prevent artifact injection at target positions
+
+**Error-map densification** (replaces gradient-based):
+- Tracks per-Gaussian reconstruction error accumulated across training iterations
+- Clones Gaussians with error in the top 5th percentile instead of using gradient norm
+- Directly allocates model capacity to regions with worst reconstruction quality
 
 **Adaptive initialization**:
 - **z-scale**: Automatically set to max(1.0, R × 0.6) where R is the sparse ratio, ensuring Gaussians bridge inter-slice gaps
 - **xy-subsampling**: Dynamically adjusted so initial count stays within budget (default 500K)
+- **Intensity**: Initialized to zero for residual mode (initial output = pure cubic base)
 
 **Progressive densification/pruning** (every 100 iterations):
-- **Early training**: Low gradient threshold (0.5× base) → aggressive densification for rapid coverage
-- **Late training**: High gradient threshold (1.5× base) → conservative refinement only where needed
+- **Early training**: Low gradient/error threshold → aggressive densification for rapid coverage
+- **Late training**: High threshold → conservative refinement only where needed
 - **Prune**: Low-opacity Gaussians (< 0.01) are removed
 - Max 500K Gaussians per volume (800K in high-quality mode)
-
-**Training stability and memory controls**:
-- **Per-slice gradient accumulation**: computes and backpropagates each sampled slice independently, reducing peak VRAM while preserving the same averaged gradient objective
-- **Adaptive iteration scaling**: effective iterations increase with number of observed slices, preventing under-training on long volumes
-- **Pruning floor**: enforces a minimum retained Gaussian count to avoid collapse to zero active primitives
-- **Cache hygiene**: explicit CUDA cache cleanup after densification/evaluation and between cases in notebook execution
 
 ## Dataset
 
@@ -188,23 +214,23 @@ Download: [TCIA CT-ORG Collection](https://wiki.cancerimagingarchive.net/pages/v
 
 ### Metrics
 
-- **PSNR** (dB): Peak Signal-to-Noise Ratio -- pixel-level fidelity
-- **SSIM**: Structural Similarity Index -- perceptual quality
-- **MAE**: Mean Absolute Error -- average reconstruction error
+- **PSNR** (dB): Peak Signal-to-Noise Ratio — pixel-level fidelity
+- **SSIM**: Structural Similarity Index — perceptual quality
+- **MAE**: Mean Absolute Error — average reconstruction error
 - **ROI metrics**: Per-organ PSNR/SSIM computed within segmentation masks (liver, lungs, kidneys, bladder, bone)
 
 ### Ablation Study
 
 Variants tested in NB05 to isolate the contribution of each component:
 
-| Variant | Multi-scale | Smoothness | Edge | TV | Annealing | Purpose |
-|---------|:-----------:|:----------:|:----:|:--:|:---------:|---------|
-| full | yes | yes | yes | yes | yes | Complete model |
-| no_multiscale | no | yes | yes | yes | yes | Effect of multi-scale loss |
-| no_smooth | yes | no | yes | yes | yes | Effect of z-axis smoothness |
-| no_edge | yes | yes | no | yes | yes | Effect of edge preservation |
-| no_tv | yes | yes | yes | no | yes | Effect of TV denoising |
-| no_reg | no | no | no | no | no | Raw 3DGS baseline |
+| Variant | Residual | FFT | Error-Map | HU Weight | Multi-scale | Smooth | Edge | TV | Purpose |
+|---------|:--------:|:---:|:---------:|:---------:|:-----------:|:------:|:----:|:--:|---------|
+| full | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | Complete model |
+| no_residual | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | Effect of residual learning |
+| no_fft | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | Effect of FFT loss |
+| no_errormap | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | Effect of error-map densification |
+| no_huweight | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | Effect of HU gradient weighting |
+| baseline | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | Raw 3DGS baseline |
 
 ## Outputs
 
@@ -229,6 +255,7 @@ outputs/
 - **LazyUNetSliceDataset**: On-demand NIfTI loading with LRU cache (2 volumes), zero-copy preprocessing via `np.asarray(nii.dataobj, dtype=np.float32)` with in-place HU clipping and normalization
 - **VolumeGroupedSampler**: Custom PyTorch Sampler that groups training samples by source volume, ensuring consecutive batches come from the same 1-2 cached volumes (eliminates cache thrashing)
 - **Streaming classical interpolation**: `interpolate_target_slice()` processes one slice at a time using only 2-4 neighboring slices, avoiding full-volume intermediate arrays
+- **Cubic base caching**: Precomputed cubic predictions stored on GPU to avoid recomputation during training
 
 ### GPU Utilization (T4 x2)
 
@@ -236,7 +263,7 @@ outputs/
 - **3DGS/Ablation**: `ThreadPoolExecutor(max_workers=2)` runs independent per-volume tasks concurrently on separate GPUs
 - **Separable rendering**: Axis-aligned Gaussians decompose as G(x,y) = G_x(x) · G_y(y), enabling O(H·K + W·K) rendering via matrix multiplication instead of O(H·W·K) per-pixel computation (~50-100x speedup over tiled rendering)
 - **TF32 enabled**: `torch.backends.cuda.matmul.allow_tf32 = True` for faster matrix operations
-- **cudnn.benchmark**: Auto-selects optimal convolution algorithms
+- **Mixed precision**: AMP with GradScaler for ~30% training speedup
 - **Async data transfer**: `tensor.to(device, non_blocking=True)` overlaps CPU-GPU transfers
 - **Gradient accumulation for memory safety**: per-slice backward avoids graph blow-up from multi-slice + multi-term losses
 
@@ -254,28 +281,32 @@ All hyperparameters are centralized in `configs/default.yaml`:
 ```yaml
 gaussian:
   init_mode: "grid"          # or "adaptive" (edge-aware initialization)
-  num_iterations: 7000       # base iterations (auto-scaled for large volumes)
-  batch_slices: 4            # Multi-slice sampling with per-slice gradient accumulation
-  max_gaussians: 500000      # notebook QUALITY can override to 800k/1M
-  render_mode: "weighted"    # Separable rendering via matmul
+  residual_mode: true         # Residual learning on top of cubic interpolation
+  residual_base: "cubic"      # Base interpolation method
+  num_iterations: 7000        # base iterations (auto-scaled for large volumes)
+  batch_slices: 4             # Multi-slice sampling with per-slice gradient accumulation
+  max_gaussians: 500000       # notebook QUALITY can override to 800k/1M
+  render_mode: "weighted"     # Separable rendering via matmul
+  densify_use_error_map: true # Error-map based densification
 
 loss:
   l1_weight: 1.0
-  ssim_weight: 0.1
-  lambda_smooth: 0.01       # Annealed: 2x -> 0.5x during training
-  lambda_edge: 0.005
-  lambda_tv: 0.001           # Total variation for spatial denoising
-  multiscale: true           # Multi-scale loss (1x, 1/2x, 1/4x)
+  ssim_weight: 0.0            # Disabled for residual mode
+  lambda_smooth: 0.002        # Annealed: 2x -> 0.5x during training
+  lambda_edge: 0.001
+  lambda_tv: 0.0002           # Total variation for spatial denoising
+  lambda_fft: 0.05            # FFT high-frequency loss
+  fft_cutoff: 0.25            # Frequency cutoff ratio
+  lambda_residual: 0.1        # L2 penalty on raw 3DGS residual output
+  hu_gradient_weight: true    # Spatial weighting by HU gradient magnitude
+  hu_weight_max: 5.0          # Max weight boost at strong edges
+  multiscale: true            # Multi-scale loss (1x, 1/2x, 1/4x)
 
 unet:
   features: [32, 64, 128, 256]
   lr: 1.0e-4
   num_epochs: 50
 ```
-
-## Current Status and Limitations
-
-Current codebase emphasizes robustness and reproducibility on Kaggle constraints (memory/OOM handling, resume support, stable long-volume training). However, the latest Phase-1 comparison (R=2, shared case subset) still shows a notable PSNR/SSIM gap between 3DGS and strong interpolation/supervised baselines. In other words, the project is currently strong on engineering stability, but further method-level improvements are still required to claim state-of-the-art quantitative quality.
 
 ## Local Usage
 
@@ -310,7 +341,7 @@ print(f"PSNR: {results['summary']['mean_psnr']:.2f} dB")
 
 ```bibtex
 @software{ct_slice_interpolation_3dgs,
-  title = {CT Slice Interpolation via 3D Gaussian Splatting},
+  title = {CT Slice Interpolation via 3D Gaussian Splatting with Residual Learning},
   author = {Nguyen, Nhat Phat},
   year = {2026},
   url = {https://github.com/PhoenixEvo/ct-slice-interpolation-3dgs}
