@@ -568,12 +568,17 @@ class Trainer3DGS:
                 self.gaussian_model.reset_opacity(self.opacity_reset_value)
                 print(f"  Opacity reset at iter {iteration}")
 
-            # Checkpoint
+            # Checkpoint (rolling: keep only latest to save disk)
             if (
                 iteration > 0
                 and iteration % self.checkpoint_interval == 0
             ):
-                self.save_checkpoint(f"iter_{iteration}.pt")
+                ckpt_name = f"iter_{iteration}.pt"
+                self.save_checkpoint(ckpt_name)
+                # Delete previous intermediate checkpoints
+                for old in self.checkpoint_dir.glob("iter_*.pt"):
+                    if old.name != ckpt_name:
+                        old.unlink(missing_ok=True)
 
         total_time = time.time() - t_start
         self.training_time = total_time

@@ -97,6 +97,6 @@ eval:
 training:
   seed: 42
   mixed_precision: true
-  checkpoint_interval: 500
+  checkpoint_interval: 2000
   log_interval: 50
   num_workers: 2
