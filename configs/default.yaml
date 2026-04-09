@@ -40,9 +40,10 @@ gaussian:
   init_scale_z: 1.0        # Initial scale in z (slices)
   init_opacity: 0.8        # Initial opacity (before sigmoid)
 
-  # Residual learning (NEW)
+  # Residual learning
   residual_mode: true       # Enable residual learning (3DGS predicts residual on top of cubic)
   residual_base: "cubic"    # Base interpolation: "cubic" or "linear"
+  loo_ratio: 0.3            # Leave-one-out ratio: fraction of batch using LOO base (enables learning corrections beyond cubic)
 
   # Optimization
   lr_position: 0.005         # Slightly lower position LR for stability in residual mode
@@ -79,7 +80,7 @@ loss:
   lambda_tv: 0.0002          # Reduced for residual mode
   lambda_fft: 0.05           # Increased: key signal for residual learning (high-freq detail)
   fft_cutoff: 0.25           # Slightly lower cutoff to capture more frequency detail
-  lambda_residual: 0.1       # L2 penalty on raw 3DGS residual output (prevents artifacts)
+  lambda_residual: 0.01      # Reduced: allow nonzero corrections with LOO training
   hu_gradient_weight: true   # Weight loss by HU gradient magnitude
   hu_weight_max: 5.0         # Increased: stronger focus on organ boundaries
   multiscale: true           # Multi-scale reconstruction loss (1x, 1/2x, 1/4x)

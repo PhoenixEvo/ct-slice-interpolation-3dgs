@@ -73,12 +73,15 @@ class Trainer3DGS:
         train_config = config.get("training", {})
         self._gs_config = gs_config
 
-        # ===== RESIDUAL MODE (NEW) =====
+        # ===== RESIDUAL MODE =====
         self.residual_mode = gs_config.get("residual_mode", False)
         self.residual_base = gs_config.get("residual_base", "cubic")
+        self.loo_ratio = gs_config.get("loo_ratio", 0.0)
         if self.residual_mode:
             print(f"  *** RESIDUAL MODE ENABLED (base: {self.residual_base}) ***")
             print(f"  3DGS will predict residual on top of {self.residual_base} interpolation")
+            if self.loo_ratio > 0:
+                print(f"  LOO mixed training: {self.loo_ratio:.0%} of batch uses leave-one-out base")
 
         # Error-map densification config
         self.use_error_map = gs_config.get("densify_use_error_map", False)
@@ -189,9 +192,12 @@ class Trainer3DGS:
             torch.cuda.synchronize()
 
         # ===== PRECOMPUTE CUBIC/LINEAR BASE FOR RESIDUAL MODE =====
-        self.cubic_cache = {}
+        self.cubic_cache = {}      # Full cubic base (all observed as control)
+        self.loo_cache = {}        # LOO cubic base (leave-one-out per observed)
         if self.residual_mode:
             self._precompute_residual_base()
+            if self.loo_ratio > 0:
+                self._precompute_loo_base()
 
         # For residual mode: initialize Gaussian intensities to zero
         # since we want the initial 3DGS output to be zero (pure cubic base)
@@ -215,25 +221,18 @@ class Trainer3DGS:
         }
 
     def _precompute_residual_base(self) -> None:
-        """Precompute cubic/linear interpolation for all slices.
+        """Precompute full cubic/linear base for all slices.
 
-        Uses ALL observed slices as control points for consistency between
-        training and inference. For observed slices, the base prediction
-        will differ from GT — the difference is the residual target.
-
-        Note: We use the SAME observed set for both training and target
-        base computation. This eliminates the train/inference mismatch
-        that occurred with leave-one-out, where training saw a different
-        (worse) base than inference saw.
+        Uses ALL observed slices as control points (consistent train/inference).
+        At observed z-positions, cubic = GT exactly (Catmull-Rom property).
         """
         method = self.residual_base
         sorted_obs = np.sort(self.observed_indices)
 
-        # Collect all z-indices that need base computation
         all_z = set(int(z) for z in self.observed_indices)
         all_z.update(int(z) for z in self.target_indices)
 
-        print(f"  Precomputing {method} base for {len(all_z)} slices "
+        print(f"  Precomputing FULL {method} base for {len(all_z)} slices "
               f"(using {len(sorted_obs)} observed as control points)...")
 
         t_start = time.time()
@@ -250,9 +249,9 @@ class Trainer3DGS:
             torch.cuda.synchronize()
 
         elapsed = time.time() - t_start
-        print(f"  Precomputed {len(self.cubic_cache)} base slices in {elapsed:.1f}s")
+        print(f"  Precomputed {len(self.cubic_cache)} full base slices in {elapsed:.1f}s")
 
-        # Log residual statistics for debugging
+        # Log residual statistics
         residual_mags = []
         for z_idx in self.observed_indices:
             z_idx = int(z_idx)
@@ -262,7 +261,57 @@ class Trainer3DGS:
             residual_mags.append(residual)
         avg_res = np.mean(residual_mags)
         max_res = np.max(residual_mags)
-        print(f"  Residual stats: mean_abs={avg_res:.6f}, max_abs={max_res:.6f}")
+        print(f"  Full base residual stats: mean_abs={avg_res:.6f}, max_abs={max_res:.6f}")
+
+    def _precompute_loo_base(self) -> None:
+        """Precompute leave-one-out cubic base for each observed slice.
+
+        For each observed z_obs, computes cubic interpolation using all
+        OTHER observed slices as control points. This creates nonzero
+        residual targets that teach 3DGS to predict corrections.
+
+        The LOO residual at observed z approximates the cubic prediction
+        error at target z, enabling 3DGS to learn corrections that
+        can exceed cubic quality at inference.
+        """
+        method = self.residual_base
+        sorted_obs = np.sort(self.observed_indices)
+
+        print(f"  Precomputing LOO {method} base for {len(sorted_obs)} observed slices...")
+
+        t_start = time.time()
+
+        loo_residual_mags = []
+        for z_obs in sorted_obs:
+            z_obs = int(z_obs)
+            # Leave out this slice from control points
+            loo_obs = sorted_obs[sorted_obs != z_obs]
+            if len(loo_obs) < 2:
+                # Can't compute meaningful cubic with <2 control points
+                self.loo_cache[z_obs] = self.cubic_cache[z_obs]
+                continue
+
+            loo_slice = ClassicalInterpolator.interpolate_target_slice(
+                self.volume, loo_obs, z_obs, method
+            )
+            self.loo_cache[z_obs] = torch.from_numpy(
+                loo_slice
+            ).unsqueeze(0).float().to(self.device, non_blocking=True)
+
+            # Track LOO residual magnitude
+            gt = self.observed_slices[z_obs]
+            residual = (gt - self.loo_cache[z_obs]).abs().mean().item()
+            loo_residual_mags.append(residual)
+
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+
+        elapsed = time.time() - t_start
+        avg_loo = np.mean(loo_residual_mags) if loo_residual_mags else 0
+        max_loo = np.max(loo_residual_mags) if loo_residual_mags else 0
+        print(f"  Precomputed {len(self.loo_cache)} LOO base slices in {elapsed:.1f}s")
+        print(f"  LOO residual stats: mean_abs={avg_loo:.6f}, max_abs={max_loo:.6f}")
+        print(f"  (LOO residuals are nonzero -> 3DGS learns meaningful corrections)")
 
     @staticmethod
     def _infer_sparse_ratio(observed_indices: np.ndarray) -> int:
@@ -366,22 +415,26 @@ class Trainer3DGS:
         return self.observed_slices[z_idx]
 
     def _compose_prediction(
-        self, rendered: torch.Tensor, z_idx: int
+        self, rendered: torch.Tensor, z_idx: int, use_loo: bool = False
     ) -> torch.Tensor:
         """Compose final prediction from rendered output.
 
         In standard mode: returns rendered directly.
-        In residual mode: returns (cubic_base + rendered_residual).
+        In residual mode: returns (base + rendered_residual).
 
         Args:
             rendered: Raw renderer output (1, H, W).
             z_idx: Slice index.
+            use_loo: If True, use leave-one-out cubic base (training only).
 
         Returns:
             Final prediction (1, H, W).
         """
-        if self.residual_mode and z_idx in self.cubic_cache:
-            return self.cubic_cache[z_idx] + rendered
+        if self.residual_mode:
+            if use_loo and z_idx in self.loo_cache:
+                return self.loo_cache[z_idx] + rendered
+            elif z_idx in self.cubic_cache:
+                return self.cubic_cache[z_idx] + rendered
         return rendered
 
     def train(self) -> Dict:
@@ -422,9 +475,16 @@ class Trainer3DGS:
             sum_fft = 0.0
             last_psnr = 0.0
 
+            # Decide which slices use LOO base this iteration
+            use_loo_flags = {}
+            if self.residual_mode and self.loo_ratio > 0 and len(self.loo_cache) > 0:
+                for z in batch_z:
+                    use_loo_flags[int(z)] = (np.random.random() < self.loo_ratio)
+
             for z_idx in batch_z:
                 z_idx = int(z_idx)
                 gt_slice = self._get_training_target(z_idx)
+                slice_use_loo = use_loo_flags.get(z_idx, False)
 
                 with autocast(enabled=self.mixed_precision):
                     params = self.gaussian_model.get_params()
@@ -437,8 +497,11 @@ class Trainer3DGS:
                     )
 
                     # In residual mode: compose full prediction for loss
+                    # LOO base creates nonzero residual → 3DGS learns corrections
                     if self.residual_mode:
-                        prediction = self._compose_prediction(rendered, z_idx)
+                        prediction = self._compose_prediction(
+                            rendered, z_idx, use_loo=slice_use_loo
+                        )
                     else:
                         prediction = rendered
 
@@ -456,13 +519,21 @@ class Trainer3DGS:
                                 float(neighbor_z),
                             )
                             if self.residual_mode:
-                                adjacent_pred = self._compose_prediction(adj_rendered, neighbor_z)
+                                adjacent_pred = self._compose_prediction(
+                                    adj_rendered, neighbor_z, use_loo=slice_use_loo
+                                )
                             else:
                                 adjacent_pred = adj_rendered
 
+                    # Residual penalty: only apply on full-base slices (push to zero)
+                    # LOO slices naturally need nonzero output, so skip penalty
+                    res_out = None
+                    if self.residual_mode and not slice_use_loo:
+                        res_out = rendered
+
                     loss_dict = self.criterion(
                         prediction, gt_slice, adjacent_pred, adjacent_gt,
-                        residual_output=rendered if self.residual_mode else None,
+                        residual_output=res_out,
                     )
                     slice_loss = loss_dict["total"] / B
 
