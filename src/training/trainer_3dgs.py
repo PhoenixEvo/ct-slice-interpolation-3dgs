@@ -77,11 +77,12 @@ class Trainer3DGS:
         self.residual_mode = gs_config.get("residual_mode", False)
         self.residual_base = gs_config.get("residual_base", "cubic")
         self.loo_ratio = gs_config.get("loo_ratio", 0.0)
+        self.loo_start = gs_config.get("loo_start", 0.6)  # Start LOO training at 60% progress
         if self.residual_mode:
             print(f"  *** RESIDUAL MODE ENABLED (base: {self.residual_base}) ***")
             print(f"  3DGS will predict residual on top of {self.residual_base} interpolation")
             if self.loo_ratio > 0:
-                print(f"  LOO mixed training: {self.loo_ratio:.0%} of batch uses leave-one-out base")
+                print(f"  Two-phase LOO: standard until {self.loo_start:.0%}, then LOO ramps to {self.loo_ratio:.0%}")
 
         # Error-map densification config
         self.use_error_map = gs_config.get("densify_use_error_map", False)
@@ -475,11 +476,19 @@ class Trainer3DGS:
             sum_fft = 0.0
             last_psnr = 0.0
 
-            # Decide which slices use LOO base this iteration
+            # Two-phase LOO scheduling:
+            # Phase A (0 to loo_start): standard training, stable convergence
+            # Phase B (loo_start to end): LOO ramps up, learn corrections
             use_loo_flags = {}
             if self.residual_mode and self.loo_ratio > 0 and len(self.loo_cache) > 0:
-                for z in batch_z:
-                    use_loo_flags[int(z)] = (np.random.random() < self.loo_ratio)
+                if progress > self.loo_start:
+                    # Ramp loo_ratio from 0 to max over Phase B
+                    loo_progress = (progress - self.loo_start) / max(0.01, 1.0 - self.loo_start)
+                    current_loo_ratio = self.loo_ratio * min(1.0, loo_progress)
+                    for z in batch_z:
+                        use_loo_flags[int(z)] = (np.random.random() < current_loo_ratio)
+                    if iteration % 500 == 0:
+                        print(f"  [LOO Phase B] progress={progress:.2f}, loo_ratio={current_loo_ratio:.2f}")
 
             for z_idx in batch_z:
                 z_idx = int(z_idx)
