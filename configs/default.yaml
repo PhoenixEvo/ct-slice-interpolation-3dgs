@@ -43,8 +43,8 @@ gaussian:
   # Residual learning
   residual_mode: true       # Enable residual learning (3DGS predicts residual on top of cubic)
   residual_base: "cubic"    # Base interpolation: "cubic" or "linear"
-  loo_ratio: 1.0            # Max LOO ratio in Phase B (ramps from 0 to this)
-  loo_start: 0.6            # Phase B starts at 60% of training progress
+  loo_ratio: 0.0            # Disabled: LOO overcorrects at R=2 (magnitude mismatch)
+  loo_start: 0.6            # (unused when loo_ratio=0)
 
   # Optimization
   lr_position: 0.005         # Slightly lower position LR for stability in residual mode
@@ -53,8 +53,8 @@ gaussian:
   lr_scale: 0.005
   lr_opacity: 0.01
   lr_intensity: 0.02         # Higher LR for intensity — residual targets are small but must converge fast
-  num_iterations: 7000       # Base iterations (auto-scaled for large volumes)
-  batch_slices: 4            # Observed slices per iteration (1=original, 4-8=better gradients)
+  num_iterations: 10000      # Increased from 7000: more convergence for large volumes
+  batch_slices: 6            # Increased from 4: better gradient estimate per iteration
   warmup_iterations: 200
 
   # Densification & pruning
@@ -81,7 +81,7 @@ loss:
   lambda_tv: 0.0002          # Reduced for residual mode
   lambda_fft: 0.05           # Increased: key signal for residual learning (high-freq detail)
   fft_cutoff: 0.25           # Slightly lower cutoff to capture more frequency detail
-  lambda_residual: 0.0       # Disabled: allow nonzero corrections in LOO phase
+  lambda_residual: 0.1       # L2 penalty: push 3DGS output firmly to zero (match cubic)
   hu_gradient_weight: true   # Weight loss by HU gradient magnitude
   hu_weight_max: 5.0         # Increased: stronger focus on organ boundaries
   multiscale: true           # Multi-scale reconstruction loss (1x, 1/2x, 1/4x)
