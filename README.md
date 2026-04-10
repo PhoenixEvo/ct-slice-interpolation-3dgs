@@ -22,7 +22,7 @@ This project explores whether **3D Gaussian Splatting** — originally developed
 
 ## Key Contributions
 
-- **Residual 3DGS**: Novel formulation where 3DGS predicts a residual correction on top of cubic interpolation, guaranteeing PSNR ≥ cubic baseline while enabling fine-detail improvements
+- **Residual 3DGS**: Novel formulation where 3DGS predicts a residual correction on top of cubic interpolation, achieving near-cubic quality while enabling fine-detail learning
 - **Custom 3DGS pipeline** adapted for axis-aligned medical slice rendering (no rotation parameters, reducing model complexity)
 - **Separable differentiable rendering**: Exploits axis-aligned Gaussian structure for O(H·K + W·K) rendering via matrix multiplication, ~50-100x faster than naive per-pixel computation
 - **FFT high-frequency loss**: Frequency-domain loss penalizing discrepancies in high-frequency components, forcing the model to capture sharp organ boundaries and bone interfaces
@@ -149,7 +149,7 @@ Per-volume self-supervised optimization. A set of axis-aligned 3D Gaussians is o
 
 - **Cubic base**: Precomputed Catmull-Rom interpolation using all observed slices as control points
 - **3DGS residual**: Learned correction predicting fine details that cubic interpolation misses
-- **Guarantee**: Since 3DGS converging to zero residual produces exactly the cubic result, PSNR is bounded below by cubic quality
+- **Residual design**: 3DGS intensities initialized to zero, so the initial prediction equals the cubic base; training refines from this strong starting point
 
 **Gaussian parameterization** (per Gaussian):
 - Position (x, y, z) in volume coordinates
