@@ -53,8 +53,8 @@ gaussian:
   lr_scale: 0.005
   lr_opacity: 0.01
   lr_intensity: 0.02         # Higher LR for intensity — residual targets are small but must converge fast
-  num_iterations: 10000      # Increased from 7000: more convergence for large volumes
-  batch_slices: 6            # Increased from 4: better gradient estimate per iteration
+  num_iterations: 7000       # Base iterations (auto-scaled for large volumes)
+  batch_slices: 4            # Observed slices per iteration
   warmup_iterations: 200
 
   # Densification & pruning
