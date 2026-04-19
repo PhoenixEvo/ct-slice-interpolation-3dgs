@@ -69,7 +69,7 @@ class Trainer3DGS:
 
         # Extract config
         gs_config = config.get("gaussian", {})
-        loss_config = config.get("loss", {})
+        loss_config = dict(config.get("loss", {}))  # local copy to allow rescaling
         train_config = config.get("training", {})
         self._gs_config = gs_config
 
@@ -83,6 +83,29 @@ class Trainer3DGS:
             print(f"  3DGS will predict residual on top of {self.residual_base} interpolation")
             if self.loo_ratio > 0:
                 print(f"  Two-phase LOO: standard until {self.loo_start:.0%}, then LOO ramps to {self.loo_ratio:.0%}")
+        else:
+            # Default loss weights in configs/default.yaml are tuned for residual_mode=True
+            # (residual magnitude ~10x smaller than absolute prediction). When residual_mode
+            # is OFF, applying those tuned weights to absolute predictions causes loss to
+            # blow up to NaN/Inf. Rescale to recover stable training behaviour.
+            rescale_map = {
+                "lambda_smooth": 10.0,
+                "lambda_edge": 10.0,
+                "lambda_tv": 10.0,
+                "lambda_fft": 0.1,
+            }
+            for k, factor in rescale_map.items():
+                if k in loss_config:
+                    loss_config[k] = float(loss_config[k]) * factor
+            # Residual penalty has no meaning when there is no residual to penalize
+            loss_config["lambda_residual"] = 0.0
+            # SSIM is suppressed in residual mode (residuals near zero); enable it back
+            if loss_config.get("ssim_weight", 0.0) < 0.05:
+                loss_config["ssim_weight"] = 0.1
+            print(
+                "  [non-residual rescale] smooth/edge/tv x10, fft x0.1, "
+                "residual=0, ssim>=0.1"
+            )
 
         # Error-map densification config
         self.use_error_map = gs_config.get("densify_use_error_map", False)
@@ -220,6 +243,10 @@ class Trainer3DGS:
             "psnr_train": [],
             "lr_position": [],
         }
+
+        # Counter for non-finite loss occurrences (used to detect divergence)
+        self.nan_skips = 0
+        self.aborted_early = False
 
     def _precompute_residual_base(self) -> None:
         """Precompute full cubic/linear base for all slices.
@@ -546,6 +573,25 @@ class Trainer3DGS:
                     )
                     slice_loss = loss_dict["total"] / B
 
+                # Guard: skip backward if loss is NaN/Inf (e.g. mismatched loss
+                # weights for non-residual mode, or AMP overflow). Avoids polluting
+                # parameters with NaN which would silently break the rest of training.
+                if not torch.isfinite(slice_loss):
+                    self.nan_skips += 1
+                    if self.nan_skips <= 3 or self.nan_skips % 50 == 0:
+                        print(
+                            f"  [WARN] Non-finite loss at iter {iteration} "
+                            f"(slice z={z_idx}), skipping. total_skips={self.nan_skips}"
+                        )
+                    if self.nan_skips >= 100:
+                        print(
+                            f"  [ABORT] >=100 non-finite losses encountered. "
+                            f"Stopping training early at iter {iteration}."
+                        )
+                        self.aborted_early = True
+                        break
+                    continue
+
                 if slice_loss.grad_fn is not None:
                     self.scaler.scale(slice_loss).backward()
 
@@ -573,9 +619,25 @@ class Trainer3DGS:
                     mse_i = ((prediction.detach() - gt_slice.detach()) ** 2).mean().item()
                     last_psnr = 10 * np.log10(1.0 / max(mse_i, 1e-10))
 
+            if self.aborted_early:
+                break
+
             self.gaussian_model.accumulate_gradients()
             self.scaler.step(self.optimizer)
             self.scaler.update()
+
+            # Sanitize parameters if AMP overflow / underflow leaked NaNs into them.
+            # Resets affected entries to a benign value so subsequent iterations can
+            # continue rather than silently produce NaN renderings.
+            with torch.no_grad():
+                for p in (
+                    self.gaussian_model.positions,
+                    self.gaussian_model.log_scales,
+                    self.gaussian_model.raw_opacity,
+                    self.gaussian_model.intensity,
+                ):
+                    if not torch.isfinite(p).all():
+                        p.nan_to_num_(nan=0.0, posinf=1.0, neginf=-1.0)
 
             if iteration % self.log_interval == 0:
                 cur_lr = self._get_position_lr(iteration)
@@ -786,6 +848,8 @@ class Trainer3DGS:
             np.mean(np.abs(predictions - gt_slices))
         )
         result["summary"]["residual_mode"] = self.residual_mode
+        result["summary"]["training_nan_skips"] = int(getattr(self, "nan_skips", 0))
+        result["summary"]["aborted_early"] = bool(getattr(self, "aborted_early", False))
 
         return result
 
