@@ -8,17 +8,29 @@ CT and MRI volumes typically have high in-plane (x-y) resolution but significant
 
 This project explores whether **3D Gaussian Splatting** — originally developed for novel view synthesis in computer vision — can serve as a self-supervised, per-volume optimization method for CT slice interpolation that outperforms classical approaches and competes with supervised deep learning baselines.
 
-## Preliminary Results (Phase 1 Scout, R=2)
+## Results (21 Test Cases, High Quality)
 
-| Method | PSNR (dB) | SSIM | Training Data? |
-|--------|-----------|------|:--------------:|
-| Nearest | 34.67 | — | ✗ |
-| Linear | 41.22 | — | ✗ |
-| **Cubic** | **42.58** | — | ✗ |
-| **U-Net 2D** | 41.44 | — | ✓ (98 volumes) |
-| **3DGS (Ours)** | **42.32** | **0.9646** | ✗ |
+| Method | R=2 PSNR | R=3 PSNR | R=4 PSNR | Training Data? | Category |
+|--------|----------|----------|----------|:--------------:|----------|
+| Nearest | 35.11 | 35.08 | 33.48 | ✗ | Classical |
+| Linear | 41.74 | 38.12 | 35.98 | ✗ | Classical |
+| **Cubic** | **43.04** | **38.73** | **36.30** | ✗ | Classical |
+| U-Net 2D | 41.92 | 35.31 | 34.70 | ✓ (98 vols) | Supervised DL |
+| ArSSR (Wu et al., 2022) | TBD | TBD | TBD | ✓ (98 vols) | INR (1 model, all R) |
+| SAINT (Peng et al., 2020) | TBD | TBD | TBD | ✓ (98 vols) | Supervised SOTA (per-R) |
+| **3DGS (Ours)** | **42.49** | **38.61** | **36.20** | ✗ | Per-volume self-supervised |
 
-> **Key takeaway**: 3DGS achieves **-0.25 dB** vs cubic (within noise margin) and **+0.88 dB** vs U-Net, all without any external training data — the model is optimized purely from the observed slices of each individual volume.
+> ArSSR and SAINT numbers are populated by `kaggle_notebooks/07_baseline_arssr.ipynb` and `kaggle_notebooks/08_baseline_saint.ipynb` and injected into `kaggle_notebooks/06_visualization.ipynb` for bar charts and paired t-tests.
+
+| Metric | R=2 | R=3 | R=4 |
+|--------|-----|-----|-----|
+| Δ vs Cubic | -0.56 dB | -0.11 dB | -0.10 dB |
+| Δ vs Linear | +0.75 dB | +0.49 dB | +0.22 dB |
+| Cases within 0.5 dB of cubic | 15/21 | 21/21 | 20/21 |
+| Cases exceeding cubic | 2/21 | 2/21 | 8/21 |
+| Mean SSIM | 0.9651 | 0.9482 | 0.9263 |
+
+> **Key takeaway**: 3DGS closely matches cubic across all sparse ratios (Δ = -0.10 to -0.56 dB) while being entirely self-supervised — optimized purely from observed slices of each volume, with no external training data.
 
 ## Key Contributions
 
@@ -102,8 +114,10 @@ All notebooks are designed as self-contained Kaggle notebooks. Each loads raw CT
 | 02 | `02_baseline_classical.ipynb` | Streaming slice-by-slice classical interpolation (nearest/linear/cubic) | ~30 min (CPU) |
 | 03 | `03_baseline_unet.ipynb` | U-Net 2D training + evaluation for R=2,3,4 with multi-GPU | ~8-12h total |
 | 04 | `04_3dgs_training.ipynb` | 3DGS per-volume optimization with 3-phase strategy | ~15 min - 8h |
-| 05 | `05_benchmark_ablation.ipynb` | Cross-method comparison + ablation (regularization variants) | ~1-3h |
-| 06 | `06_visualization.ipynb` | Publication figures: bar charts, slice comparisons, per-organ plots | ~10 min |
+| 05 | `05_benchmark_ablation.ipynb` | Cross-method comparison + 15-variant ablation study | ~7-9h (or ~2-3h with PARTITION) |
+| 06 | `06_visualization.ipynb` | Publication figures + paired t-tests (3DGS vs each baseline) | ~10 min |
+| 07 | `07_baseline_arssr.ipynb` | ArSSR pretraining (arbitrary-scale INR) + zero-shot eval for R=2/3/4 | ~7-9h (pretrain once) |
+| 08 | `08_baseline_saint.ipynb` | SAINT SOTA: train 3 models (R=2/3/4) + eval | ~10-13h total (run each R in a separate session) |
 
 ### NB04 Phased Strategy
 
@@ -140,6 +154,26 @@ A 4-level U-Net (features: 32-64-128-256) trained to predict a missing middle sl
 - **Output**: 1-channel predicted middle slice
 - **Loss**: L1 + 0.1 * SSIM
 - **Optimizer**: Adam (lr=1e-4, ReduceLROnPlateau)
+
+### ArSSR (SOTA, INR Arbitrary-Scale SR)
+
+Re-implementation of Wu et al., "An Arbitrary Scale Super-Resolution Approach for 3D MR Images via Implicit Neural Representation" (IEEE JBHI 2022).
+
+- **Encoder**: Lightweight 3D RDN (4 blocks x 4 conv layers, 64 feats, growth 32), produces a feature volume with no spatial downsampling.
+- **Decoder**: 5-layer MLP INR conditioned on a bilinear-sampled feature and a relative coordinate.
+- **Training**: Pretrained once on 98 training volumes with random-scale z-axis downsampling (s continuous in [2, 4]). 200k iters, patch HR = 48x48x32, coords-per-patch = 4096. Cosine lr 1e-4 -> 1e-5, AMP on.
+- **Inference**: Applied zero-shot to 21 test cases at R=2, 3, 4; only z-axis is super-resolved (xy is preserved), xy-tiled to fit on T4.
+- **Paper reference**: https://arxiv.org/abs/2110.14476
+
+### SAINT (SOTA, Supervised CT Slice Interpolation)
+
+Re-implementation of Peng et al., "SAINT: Spatially Aware Interpolation NeTwork for Medical Slice Synthesis" (CVPR 2020).
+
+- **Coronal branch**: 2D EDSR (16 residual blocks, 64 feats, residual scale 0.1), z-axis-only transposed-conv upsampler with scale R.
+- **Sagittal branch**: identical architecture, trained on sagittal views.
+- **Fusion**: 3-layer CNN that fuses two HR axial-slice estimates into one.
+- **Training per R**: 80k iterations; 60% of iters train branches independently, 40% train the full pipeline end-to-end (fusion loss). Loss = L1 + 0.1 * SSIM (same recipe as the U-Net baseline, for comparability).
+- **Paper reference**: https://arxiv.org/abs/2001.09449
 
 ### 3DGS with Residual Learning (Proposed Method)
 
@@ -219,33 +253,88 @@ Download: [TCIA CT-ORG Collection](https://wiki.cancerimagingarchive.net/pages/v
 - **MAE**: Mean Absolute Error — average reconstruction error
 - **ROI metrics**: Per-organ PSNR/SSIM computed within segmentation masks (liver, lungs, kidneys, bladder, bone)
 
+### Fair-Comparison Protocol
+
+All baselines (classical, U-Net, ArSSR, SAINT, 3DGS) are evaluated under an identical protocol to keep the comparison publishable:
+
+| Dimension | Setting | Where it is enforced |
+|-----------|---------|----------------------|
+| Dataset | CT-ORG, 140 volumes | `src/data/ct_org_loader.py` |
+| Split | 98 train / 21 val / 21 test (fixed) | `configs/default.yaml` (`test_cases`, `val_cases`) |
+| HU normalization | clip `[-1000, 1000]` → `[0, 1]` | `CTORGLoader.preprocess_volume` |
+| Sparse simulation | Keep slice indices `0, R, 2R, ...` along z | `src/data/sparse_simulator.py` |
+| Sparse ratios | R=2, 3, 4 | All NB03/04/07/08 use the same values |
+| Random seed | 42 | `src/utils/seed.set_seed(42)` in every notebook |
+| Metrics | PSNR, SSIM, MAE + per-organ ROI | `src/evaluation/metrics.evaluate_volume` |
+| Loss (supervised baselines) | L1 + 0.1·SSIM | Identical between U-Net and SAINT |
+| Logging | `training_time_s`, `inference_time_s`, per-case JSON | Saved in `outputs/<method>/per_case/` |
+
+Paired t-tests (3DGS vs each baseline, matched per case_idx) are generated in `kaggle_notebooks/06_visualization.ipynb` and saved as `outputs/figures/comparison_table.csv` for direct inclusion in the paper.
+
 ### Ablation Study
 
-Variants tested in NB05 to isolate the contribution of each component:
+15 variants tested in NB05 to isolate each component's contribution. Includes paired t-tests vs Full (Ours).
 
-| Variant | Residual | FFT | Error-Map | HU Weight | Multi-scale | Smooth | Edge | TV | Purpose |
-|---------|:--------:|:---:|:---------:|:---------:|:-----------:|:------:|:----:|:--:|---------|
-| full | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | Complete model |
-| no_residual | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | Effect of residual learning |
-| no_fft | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | Effect of FFT loss |
-| no_errormap | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | Effect of error-map densification |
-| no_huweight | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | Effect of HU gradient weighting |
-| baseline | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | Raw 3DGS baseline |
+**Key Contributions:**
+
+| Variant | Description |
+|---------|-------------|
+| `full` | Complete model (Ours) |
+| `no_residual` | w/o Residual Learning |
+| `no_fft` | w/o FFT Loss |
+| `no_errormap` | w/o Error-Map Densification |
+| `no_huweight` | w/o HU Gradient Weighting |
+| `no_res_penalty` | w/o Residual Penalty |
+
+**Regularization:**
+
+| Variant | Description |
+|---------|-------------|
+| `no_reg` | w/o All Regularization |
+| `no_multiscale` | w/o Multi-scale Loss |
+| `no_smooth` | w/o Smoothness |
+| `no_edge` | w/o Edge Preservation |
+| `no_tv` | w/o TV Denoising |
+
+**Initialization & Training:**
+
+| Variant | Description |
+|---------|-------------|
+| `grid_init` | Grid initialization |
+| `adaptive_init` | Adaptive (edge-aware) initialization |
+| `no_lr_decay` | w/o LR decay |
+| `baseline` | Raw 3DGS (no improvements) |
+
+**Multi-account parallel**: Set `PARTITION = 1/2/3` to split ablation across 3 Kaggle accounts (~2-3h each instead of ~7-9h).
 
 ## Outputs
 
 ```
 outputs/
   classical_baselines/
-    summary.csv                   # All classical results
-    per_case/case{id}_R{r}.json   # Per-case detailed metrics
+    summary.csv                          # All classical results (21 cases × 3 methods × 3 ratios)
+    per_case/case{id}_R{r}.json          # Per-case detailed metrics
   unet_baseline/
-    outputs/unet_R{r}/summary.csv # U-Net results per sparse ratio
-    checkpoints/unet_R{r}/        # Model weights, history
+    outputs/unet_R{r}/summary.csv        # U-Net results per sparse ratio
+    checkpoints/unet_R{r}/               # Model weights, history
+  arssr/
+    summary.csv                          # ArSSR results (21 cases x 3 ratios)
+    per_case/case{id}_R{r}.json          # Per-case detailed metrics
+  saint/
+    summary.csv                          # SAINT results (21 cases x 3 ratios)
+    per_case/case{id}_R{r}.json
   3dgs/
-    summary.csv                   # All 3DGS results
-    per_case/case{id}_R{r}.json   # Per-case detailed metrics + Gaussian stats
-  figures/                        # Publication-ready visualizations
+    3dgs_R{r}/
+      high/
+        summary.csv                      # 3DGS results (21 cases) — high quality
+        per_case/case{id}_R{r}.json      # Per-case detailed metrics + Gaussian stats
+      standard/
+        summary.csv                      # 3DGS results (21 cases) — standard quality
+        per_case/case{id}_R{r}.json
+  ablation/
+    ablation_results.csv                 # All ablation variants
+  figures/                               # Publication-ready visualizations
+    comparison_table.csv                 # Paired t-test: 3DGS vs each baseline
 ```
 
 ## Technical Optimizations

@@ -86,6 +86,9 @@ MedGS.pdf
 3DGS CT Slice Interpolation Analysis.md
 Hướng Giải Quyết Cải Thiện Chất Lượng 3DGS cho CT Slice Interpolation.md
 comparison.txt
+*.pdf
+*.pptx
+*.png
 # Results and figures (optional - uncomment if you don't want to commit)
 # results/
 # figures/
