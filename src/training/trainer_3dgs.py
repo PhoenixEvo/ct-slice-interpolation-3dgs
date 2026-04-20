@@ -502,6 +502,11 @@ class Trainer3DGS:
             sum_tv = 0.0
             sum_fft = 0.0
             last_psnr = 0.0
+            # Track if any slice in this iteration successfully produced a
+            # scaled backward pass. GradScaler.step() asserts that at least
+            # one backward was recorded for the optimizer; if every slice
+            # was skipped by the NaN guard, we must skip the step as well.
+            did_backward = False
 
             # Two-phase LOO scheduling:
             # Phase A (0 to loo_start): standard training, stable convergence
@@ -594,6 +599,7 @@ class Trainer3DGS:
 
                 if slice_loss.grad_fn is not None:
                     self.scaler.scale(slice_loss).backward()
+                    did_backward = True
 
                 # Detach scalars for logging (frees the computation graph)
                 sum_loss += loss_dict["total"].item()
@@ -621,6 +627,13 @@ class Trainer3DGS:
 
             if self.aborted_early:
                 break
+
+            # Skip optimizer step entirely if no backward was successfully
+            # recorded this iteration (all slices produced NaN/Inf).
+            # GradScaler would otherwise raise:
+            #   "AssertionError: No inf checks were recorded for this optimizer"
+            if not did_backward:
+                continue
 
             self.gaussian_model.accumulate_gradients()
             self.scaler.step(self.optimizer)
