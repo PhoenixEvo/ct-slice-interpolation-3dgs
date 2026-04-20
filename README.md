@@ -35,17 +35,24 @@ This project explores whether **3D Gaussian Splatting** — originally developed
 ## Key Contributions
 
 - **Residual 3DGS**: Novel formulation where 3DGS predicts a residual correction on top of cubic interpolation, achieving near-cubic quality while enabling fine-detail learning
-- **Custom 3DGS pipeline** adapted for axis-aligned medical slice rendering (no rotation parameters, reducing model complexity)
-- **Separable differentiable rendering**: Exploits axis-aligned Gaussian structure for O(H·K + W·K) rendering via matrix multiplication, ~50-100x faster than naive per-pixel computation
+- **Custom 3DGS pipeline** adapted for axis-aligned medical slice rendering, with optional **oriented (quaternion-rotated) Gaussians** for oblique anatomical structures (H3a)
+- **Separable differentiable rendering**: Exploits axis-aligned Gaussian structure for O(H·K + W·K) rendering via matrix multiplication, ~50-100x faster than naive per-pixel computation; falls back to a tiled Mahalanobis path when rotation is enabled
 - **FFT high-frequency loss**: Frequency-domain loss penalizing discrepancies in high-frequency components, forcing the model to capture sharp organ boundaries and bone interfaces
 - **HU gradient-weighted reconstruction loss**: Spatial weighting based on Sobel gradient magnitude of ground truth, prioritizing reconstruction accuracy at clinically important edge structures
 - **Error-map densification**: Replaces gradient-based densification with per-pixel reconstruction error mapping, directly targeting Gaussian allocation at regions with highest reconstruction error
 - **Multi-scale reconstruction loss**: Computes L1 at 3 resolution levels (1x, 1/2x, 1/4x) for simultaneous coarse structure and fine detail learning
 - **Medical-specific regularization**: z-axis smoothness with coarse-to-fine annealing, Sobel-based edge preservation, and Total Variation loss for spatial denoising
+- **Cross-view consistency loss (H3b)**: L1 on a short z-stack of rendered slices (sagittal/coronal gradient consistency) vs the base interpolation, enforcing 3D coherence
+- **Patch-based non-local prior (H3d)**: Self-supervision signal at target z from the top-k most similar observed slices, injecting x-y correlation information that cubic cannot provide
+- **Structure-tensor-based adaptive initialization (H3c)**: Anisotropic Gaussian scales and quaternion rotations aligned with local edge tangents
+- **Advanced residual bases (H1)**: Optional `cubic_bm4d`, `sinc3d`, and `unet_blend` bases that exploit 3D self-similarity, frequency-domain zero-fill, and learned priors respectively, giving 3DGS a stronger starting point to correct
+- **Tri-plane INR baseline (H2)**: Self-supervised per-volume implicit neural representation with three 2D feature planes (xy, xz, yz) and an MLP decoder — a strong non-3DGS competitor that natively captures x-y correlations
+- **Extended perceptual metrics (H4)**: LPIPS, HFEN, and GMSD in addition to PSNR / SSIM / MAE for edge-sharpness and perceptual-quality evaluation
 - **Adaptive initialization**: Gaussian z-scale automatically adjusted based on sparse ratio; spatial subsampling adapts to keep count within budget
 - **Progressive densification**: Gradient threshold ramps from aggressive (0.5x) to conservative (1.5x) over training, promoting rapid coverage then fine refinement
 - **Residual magnitude penalty**: L2 regularization on the raw 3DGS output to prevent artifact injection at target positions
-- **Comprehensive comparison** against classical interpolation (nearest/linear/cubic) and supervised U-Net 2D
+- **Comprehensive comparison** against classical interpolation (nearest/linear/cubic + BM4D/sinc3d standalone), supervised U-Net 2D, ArSSR, SAINT, and Tri-plane INR
+- **Paired statistical testing**: Built-in paired t-test + Wilcoxon + Cohen's d helpers (`src/evaluation/statistical_tests.py`) for publication-ready comparison tables
 - **ROI-based evaluation**: Per-organ metrics (liver, lungs, kidneys, bladder, bone) using segmentation masks
 - **Kaggle-optimized pipeline**: Multi-GPU support (T4x2), memory-efficient lazy loading, session auto-resume
 
@@ -59,21 +66,27 @@ TLCN/
       sparse_simulator.py    # Sparse slice simulation (R=2, 3, 4)
       dataset.py             # PyTorch Datasets + LazyUNetSliceDataset + VolumeGroupedSampler
     models/
-      gaussian_volume.py     # 3DGS model (position, log-scale, opacity, intensity)
-                             # + error-map densification support
-      slice_renderer.py      # Differentiable renderer (separable weighted + alpha/tile fallback)
+      gaussian_volume.py     # 3DGS model (pos, log-scale, opacity, intensity,
+                             # optional quaternion rotation + structure-tensor init)
+      slice_renderer.py      # Differentiable renderer (separable + tiled
+                             # Mahalanobis path for rotated Gaussians)
       unet2d.py              # U-Net 2D baseline
-      classical_interp.py    # Nearest/linear/cubic + streaming slice-by-slice mode
+      classical_interp.py    # Nearest/linear/cubic + cubic_bm4d + sinc3d + unet_blend
+      triplane_inr.py        # Tri-plane INR baseline (3 2D feature grids + MLP)
     losses/
       reconstruction.py      # L1, L2, SSIM, FFT high-frequency, combined + multi-scale loss
       regularization.py      # SmoothnessLoss, EdgePreservationLoss, TotalVariationLoss,
-                             # TotalLoss (with FFT, HU weighting, residual penalty)
+                             # CrossViewConsistencyLoss (H3b), TotalLoss aggregator
     training/
       trainer_3dgs.py        # Per-volume 3DGS optimizer with residual learning,
-                             # error-map densification, cubic base precomputation
+                             # error-map densification, oriented Gaussians,
+                             # cross-view + patch-prior self-supervision
+      trainer_triplane.py    # Tri-plane INR per-volume trainer (residual mode)
       trainer_unet.py        # U-Net training with checkpoint resume support
     evaluation/
-      metrics.py             # PSNR, SSIM, ROI-based per-organ metrics
+      metrics.py             # PSNR, SSIM, MAE + LPIPS, HFEN, GMSD, ROI per-organ
+      statistical_tests.py   # paired_comparison, build_comparison_table,
+                             # summarize_ablation (paired t-test + Wilcoxon + Cohen's d)
       visualization.py       # Publication-ready figure generation
     utils/
       config.py              # YAML config loading
@@ -118,6 +131,7 @@ All notebooks are designed as self-contained Kaggle notebooks. Each loads raw CT
 | 06 | `06_visualization.ipynb` | Publication figures + paired t-tests (3DGS vs each baseline) | ~10 min |
 | 07 | `07_baseline_arssr.ipynb` | ArSSR pretraining (arbitrary-scale INR) + zero-shot eval for R=2/3/4 | ~7-9h (pretrain once) |
 | 08 | `08_baseline_saint.ipynb` | SAINT SOTA: train 3 models (R=2/3/4) + eval | ~10-13h total (run each R in a separate session) |
+| 09 | `09_baseline_triplane.ipynb` | Tri-plane INR per-volume baseline (self-supervised, x-y correlation native) | ~1-3h per (case, R) |
 
 ### NB04 Phased Strategy
 
@@ -251,6 +265,9 @@ Download: [TCIA CT-ORG Collection](https://wiki.cancerimagingarchive.net/pages/v
 - **PSNR** (dB): Peak Signal-to-Noise Ratio — pixel-level fidelity
 - **SSIM**: Structural Similarity Index — perceptual quality
 - **MAE**: Mean Absolute Error — average reconstruction error
+- **LPIPS** (optional, `compute_perceptual=True`): Learned Perceptual Image Patch Similarity (lower is better). Requires `pip install lpips`.
+- **HFEN**: High-Frequency Error Norm on a Laplacian-of-Gaussian response (edge fidelity, lower is better).
+- **GMSD**: Gradient Magnitude Similarity Deviation (lower is better, Xue et al. 2013).
 - **ROI metrics**: Per-organ PSNR/SSIM computed within segmentation masks (liver, lungs, kidneys, bladder, bone)
 
 ### Fair-Comparison Protocol
@@ -363,33 +380,110 @@ outputs/
 - Experiment skip: 3DGS and ablation check for existing JSON/CSV results before re-running
 - Partial save: `summary.csv` written after each sparse ratio completes
 
+## New Methods & How to Enable Them
+
+All the improvements below live behind config flags in `configs/default.yaml` and default to OFF so they do not break the baseline. Turn on one at a time and compare paired-t vs the "full" baseline via `src/evaluation/statistical_tests.summarize_ablation`.
+
+### H1 — Advanced residual bases (`gaussian.residual_base`)
+
+Switch the base interpolation the 3DGS residual is stacked on top of:
+
+| Value | Description | Trade-off |
+|-------|-------------|-----------|
+| `cubic` (default) | Catmull-Rom cubic along z | Fast, no x-y correlation |
+| `cubic_bm4d` | Cubic, then BM4D denoising on the full 3D volume | Exploits 3D self-similarity; slower setup, needs `pip install bm4d` |
+| `sinc3d` | Frequency-domain zero-fill along z (FFT) | Pure signal-processing baseline, uniform-spacing only |
+| `unet_blend` | `alpha * cubic + (1 - alpha) * unet_prediction` | Leverages a pretrained 2D U-Net, needs the predictor in code |
+
+Same options are available for the Tri-plane baseline (`triplane.residual_base`).
+
+### H2 — Tri-plane INR baseline
+
+Self-supervised per-volume INR with three 2D feature planes. Runs via `kaggle_notebooks/09_baseline_triplane.ipynb` or:
+
+```python
+from src.training import TrainerTriPlane
+trainer = TrainerTriPlane(volume, observed_indices, target_indices, config, device="cuda")
+trainer.train()
+results = trainer.evaluate_on_targets()
+```
+
+### H3 — 3DGS representational upgrades
+
+- **H3a/H3c — oriented + structure-tensor init**: `gaussian.use_rotation: true`, `gaussian.use_structure_tensor: true`. Adds a 4-vector quaternion per Gaussian (LR ramps up after a warmup) and aligns initial scales/rotations with local edge tangents.
+- **H3b — cross-view consistency**: `loss.lambda_crossview: 0.001` (set > 0 to enable), `loss.crossview_interval: 5`, `loss.crossview_window: 3`.
+- **H3d — patch-based non-local prior**: `loss.lambda_patch: 0.02`, `loss.patch_prior_k: 5`, `loss.patch_prior_interval: 5`.
+
+### H4 — Extended perceptual metrics
+
+```python
+from src.evaluation import evaluate_volume
+result = evaluate_volume(
+    predictions, ground_truths, target_indices,
+    compute_perceptual=True, lpips_device="cuda",
+)
+# result["summary"] now also includes mean_lpips / mean_hfen / mean_gmsd
+```
+
+### Paired statistical tests
+
+```python
+from src.evaluation import build_comparison_table, summarize_ablation
+table = build_comparison_table(
+    per_case_results={"3dgs": df_3dgs, "cubic": df_cubic, "triplane": df_triplane},
+    ref_method="3dgs", metric="psnr",
+)
+# table has columns: sparse_ratio, other, delta_mean, p_ttest, cohen_d, ref_wins_frac
+```
+
 ## Configuration
 
 All hyperparameters are centralized in `configs/default.yaml`:
 
 ```yaml
 gaussian:
-  init_mode: "grid"          # or "adaptive" (edge-aware initialization)
-  residual_mode: true         # Residual learning on top of cubic interpolation
-  residual_base: "cubic"      # Base interpolation method
-  num_iterations: 7000        # base iterations (auto-scaled for large volumes)
-  batch_slices: 4             # Multi-slice sampling with per-slice gradient accumulation
-  max_gaussians: 500000       # notebook QUALITY can override to 800k/1M
-  render_mode: "weighted"     # Separable rendering via matmul
-  densify_use_error_map: true # Error-map based densification
+  init_mode: "grid"           # or "adaptive" (edge-aware initialization)
+  residual_mode: true         # Residual learning on top of the base interp
+  residual_base: "cubic"      # cubic / cubic_bm4d / sinc3d / unet_blend (H1)
+  base_bm4d_sigma: 0.015      # BM4D noise sigma when residual_base=cubic_bm4d
+  base_unet_alpha: 0.7        # cubic weight when residual_base=unet_blend
+  use_rotation: false         # H3a: quaternion-rotated Gaussians
+  rotation_warmup_frac: 0.2   # ramp rotation LR from 0 after this fraction of iters
+  lr_rotation: 1.0e-3
+  use_structure_tensor: false # H3c: anisotropic init from edge tangents
+  num_iterations: 7000
+  batch_slices: 4
+  max_gaussians: 500000
+  render_mode: "weighted"
+  densify_use_error_map: true
 
 loss:
   l1_weight: 1.0
-  ssim_weight: 0.0            # Disabled for residual mode
-  lambda_smooth: 0.002        # Annealed: 2x -> 0.5x during training
+  ssim_weight: 0.0
+  lambda_smooth: 0.002
   lambda_edge: 0.001
-  lambda_tv: 0.0002           # Total variation for spatial denoising
-  lambda_fft: 0.05            # FFT high-frequency loss
-  fft_cutoff: 0.25            # Frequency cutoff ratio
-  lambda_residual: 0.1        # L2 penalty on raw 3DGS residual output
-  hu_gradient_weight: true    # Spatial weighting by HU gradient magnitude
-  hu_weight_max: 5.0          # Max weight boost at strong edges
-  multiscale: true            # Multi-scale loss (1x, 1/2x, 1/4x)
+  lambda_tv: 0.0002
+  lambda_fft: 0.05
+  fft_cutoff: 0.25
+  lambda_residual: 0.1
+  lambda_crossview: 0.0       # H3b: sagittal/coronal consistency (~0.001 when on)
+  crossview_interval: 5
+  crossview_window: 3
+  lambda_patch: 0.0           # H3d: non-local patch prior (~0.01-0.05 when on)
+  patch_prior_k: 5
+  patch_prior_interval: 5
+  hu_gradient_weight: true
+  hu_weight_max: 5.0
+  multiscale: true
+
+triplane:                      # H2: Tri-plane INR baseline
+  residual_mode: true
+  residual_base: "cubic"
+  plane_resolution: 128
+  feature_dim: 16
+  mlp_hidden: 64
+  mlp_layers: 3
+  num_iterations: 5000
 
 unet:
   features: [32, 64, 128, 256]

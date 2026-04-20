@@ -41,8 +41,25 @@ gaussian:
   init_opacity: 0.8        # Initial opacity (before sigmoid)
 
   # Residual learning
-  residual_mode: true       # Enable residual learning (3DGS predicts residual on top of cubic)
-  residual_base: "cubic"    # Base interpolation: "cubic" or "linear"
+  residual_mode: true       # Enable residual learning (3DGS predicts residual on top of base)
+  # Base interpolation options:
+  #   "cubic"       - Catmull-Rom along z (default, 1D only)
+  #   "linear"      - Linear along z
+  #   "cubic_bm4d"  - Cubic + BM4D 3D denoising (exploits x-y self-similarity)
+  #   "sinc3d"      - FFT zero-pad along z (band-limited 3D reconstruction)
+  #   "unet_blend"  - Blend of cubic and pretrained U-Net 2D predictions
+  residual_base: "cubic"
+  base_bm4d_sigma: 0.015    # Noise std for BM4D (only used by 'cubic_bm4d')
+  base_unet_alpha: 0.5      # Blend weight for U-Net base (0=pure cubic, 1=pure U-Net)
+  # H3a: Oriented Gaussians (quaternion rotation). Adds +4 params per Gaussian,
+  # improves accuracy at oblique organ boundaries. Uses the slower Mahalanobis
+  # renderer path instead of the fast separable one when active.
+  use_rotation: false
+  rotation_warmup_frac: 0.3   # Fraction of iterations with rotation frozen
+  lr_rotation: 0.001
+  # H3c: Structure-tensor-based anisotropic initialization (requires adaptive
+  # init mode + use_rotation=true to take effect).
+  use_structure_tensor: false
   loo_ratio: 0.0            # Disabled: LOO overcorrects at R=2 (magnitude mismatch)
   loo_start: 0.6            # (unused when loo_ratio=0)
 
@@ -82,9 +99,40 @@ loss:
   lambda_fft: 0.05           # Increased: key signal for residual learning (high-freq detail)
   fft_cutoff: 0.25           # Slightly lower cutoff to capture more frequency detail
   lambda_residual: 0.1       # L2 penalty: push 3DGS output firmly to zero (match cubic)
+  lambda_crossview: 0.0      # H3b cross-view consistency (set ~0.001 to enable)
+  crossview_interval: 5      # Run cross-view loss every N iterations
+  crossview_window: 3        # Stack size for sagittal/coronal check (odd, >=3)
+  lambda_patch: 0.0          # H3d non-local patch-prior (set ~0.01-0.05 to enable)
+  patch_prior_k: 5           # Top-k similar observed slices for each target prior
+  patch_prior_interval: 5    # Apply patch-prior step every N iterations
   hu_gradient_weight: true   # Weight loss by HU gradient magnitude
   hu_weight_max: 5.0         # Increased: stronger focus on organ boundaries
   multiscale: true           # Multi-scale reconstruction loss (1x, 1/2x, 1/4x)
+
+# --- Tri-plane INR baseline (self-supervised per-volume, x-y correlation native) ---
+triplane:
+  # Residual mode on a given base (same options as 3DGS)
+  residual_mode: true
+  residual_base: "cubic"      # "cubic" / "cubic_bm4d" / "sinc3d" / "unet_blend"
+  base_bm4d_sigma: 0.015
+  base_unet_alpha: 0.5
+  # Model capacity
+  feat_dim: 32
+  plane_res_xy: 128
+  plane_res_xz: 128
+  plane_res_yz: 128
+  mlp_hidden: 64
+  mlp_layers: 3
+  num_freq: 4                 # 0 to disable positional encoding
+  # Optimization
+  num_iterations: 3000
+  samples_per_iter: 16384
+  slice_batch: 2
+  slice_loss_interval: 4      # Full-slice FFT/edge loss cadence
+  lr: 5.0e-3                  # Plane params LR
+  lr_mlp: 1.0e-3              # MLP/head LR
+  weight_decay: 0.0
+  chunk_render: 65536
 
 # --- Evaluation ---
 eval:

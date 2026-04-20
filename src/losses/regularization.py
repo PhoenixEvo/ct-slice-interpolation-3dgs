@@ -122,6 +122,103 @@ class TotalVariationLoss(nn.Module):
         return diff_h.mean() + diff_w.mean()
 
 
+class CrossViewConsistencyLoss(nn.Module):
+    """Sagittal/Coronal consistency loss on a local rendered mini-volume.
+
+    H3b rationale: the 3DGS renderer operates on axial (xy) slices, so
+    without extra supervision nothing enforces that the reconstructed
+    volume is coherent when viewed sagittally (xz) or coronally (yz).
+    This loss takes a short stack of rendered neighboring slices and
+    asks them to match the same stack cut from the cubic (or any) base,
+    in three aspects:
+
+    1. Direct L1 match on the stack values (anchors the residual).
+    2. Through-plane z-gradient match: encourages the local volume's
+       z-variations to mirror the base's z-variations -> sagittal and
+       coronal edges behave consistently.
+    3. Optional in-plane gradient match on the sagittal and coronal
+       cross-sections (Sobel along z inside those slices).
+
+    Expected weight: very small (~0.001) to act as a regularizer without
+    dominating the reconstruction loss.
+    """
+
+    def __init__(
+        self,
+        use_gradient: bool = True,
+        lambda_zgrad: float = 1.0,
+        lambda_crosssec: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.use_gradient = use_gradient
+        self.lambda_zgrad = lambda_zgrad
+        self.lambda_crosssec = lambda_crosssec
+
+    def forward(
+        self,
+        pred_stack: torch.Tensor,
+        base_stack: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute cross-view consistency loss.
+
+        Args:
+            pred_stack: (D_local, H, W) or (1, D_local, H, W) stack of
+                rendered slices at consecutive z positions.
+            base_stack: same shape as pred_stack; e.g. cubic base at the
+                same z positions.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        # Flatten batch dim if present
+        if pred_stack.dim() == 4 and pred_stack.shape[0] == 1:
+            pred_stack = pred_stack.squeeze(0)
+            base_stack = base_stack.squeeze(0)
+        if pred_stack.dim() != 3:
+            return pred_stack.sum() * 0.0
+
+        # Direct L1 on the local mini-volume (very small weight via caller)
+        l_direct = F.l1_loss(pred_stack, base_stack)
+
+        if not self.use_gradient or pred_stack.shape[0] < 2:
+            return l_direct
+
+        # Through-plane (z) gradient match: (D-1, H, W)
+        dz_pred = pred_stack[1:] - pred_stack[:-1]
+        dz_base = base_stack[1:] - base_stack[:-1]
+        l_zgrad = F.l1_loss(dz_pred, dz_base)
+
+        # Sagittal cross-sections at a few random y columns: (D, H)
+        # Coronal cross-sections at a few random x rows: (D, W)
+        # We use the in-plane gradient along the spatial axis of those views
+        # (i.e. Sobel H in sagittal, Sobel W in coronal).
+        D_loc, H, W = pred_stack.shape
+        n_samples = min(4, max(1, H // 32))
+        y_idx = torch.linspace(0, W - 1, n_samples, device=pred_stack.device).long()
+        x_idx = torch.linspace(0, H - 1, n_samples, device=pred_stack.device).long()
+
+        sag_pred = pred_stack[:, :, y_idx]  # (D, H, n)
+        sag_base = base_stack[:, :, y_idx]
+        cor_pred = pred_stack[:, x_idx, :]  # (D, n, W)
+        cor_base = base_stack[:, x_idx, :]
+
+        # Spatial gradient in each cross-section (first-order diff)
+        def _grad_h(t: torch.Tensor) -> torch.Tensor:
+            return t[:, 1:, ...] - t[:, :-1, ...]
+
+        def _grad_w(t: torch.Tensor) -> torch.Tensor:
+            return t[..., 1:] - t[..., :-1]
+
+        l_sag = F.l1_loss(_grad_h(sag_pred), _grad_h(sag_base))
+        l_cor = F.l1_loss(_grad_w(cor_pred), _grad_w(cor_base))
+
+        return (
+            l_direct
+            + self.lambda_zgrad * l_zgrad
+            + self.lambda_crosssec * (l_sag + l_cor)
+        )
+
+
 class TotalLoss(nn.Module):
     """Total loss combining multi-scale reconstruction, FFT, and regularization.
 
@@ -142,6 +239,7 @@ class TotalLoss(nn.Module):
         lambda_fft: float = 0.01,
         fft_cutoff: float = 0.3,
         lambda_residual: float = 0.0,
+        lambda_crossview: float = 0.0,
         l1_weight: float = 1.0,
         ssim_weight: float = 0.1,
         hu_gradient_weight: bool = False,
@@ -155,6 +253,7 @@ class TotalLoss(nn.Module):
         self.lambda_tv = lambda_tv
         self.lambda_fft = lambda_fft
         self.lambda_residual = lambda_residual
+        self.lambda_crossview = lambda_crossview
         self._lambda_smooth = lambda_smooth
         self.hu_gradient_weight = hu_gradient_weight
         self.hu_weight_max = hu_weight_max
@@ -172,6 +271,7 @@ class TotalLoss(nn.Module):
         self.smoothness_loss = SmoothnessLoss()
         self.edge_loss = EdgePreservationLoss()
         self.tv_loss = TotalVariationLoss()
+        self.crossview_loss = CrossViewConsistencyLoss()
 
         # FFT high-frequency loss (new)
         if lambda_fft > 0:
@@ -200,6 +300,8 @@ class TotalLoss(nn.Module):
         adjacent_pred: Optional[torch.Tensor] = None,
         adjacent_target: Optional[torch.Tensor] = None,
         residual_output: Optional[torch.Tensor] = None,
+        crossview_pred_stack: Optional[torch.Tensor] = None,
+        crossview_base_stack: Optional[torch.Tensor] = None,
     ) -> dict:
         """Compute total loss with all components.
 
@@ -253,12 +355,25 @@ class TotalLoss(nn.Module):
         else:
             l_residual = prediction.sum() * 0.0
 
+        # Cross-view consistency loss (H3b)
+        if (
+            self.lambda_crossview > 0
+            and crossview_pred_stack is not None
+            and crossview_base_stack is not None
+        ):
+            l_crossview = self.crossview_loss(
+                crossview_pred_stack, crossview_base_stack,
+            )
+        else:
+            l_crossview = prediction.sum() * 0.0
+
         total = (l_rec
                  + self._lambda_smooth * l_smooth
                  + self.lambda_edge * l_edge
                  + self.lambda_tv * l_tv
                  + self.lambda_fft * l_fft
-                 + self.lambda_residual * l_residual)
+                 + self.lambda_residual * l_residual
+                 + self.lambda_crossview * l_crossview)
 
         return {
             "total": total,
@@ -268,4 +383,5 @@ class TotalLoss(nn.Module):
             "tv": l_tv,
             "fft": l_fft,
             "residual": l_residual,
+            "crossview": l_crossview,
         }

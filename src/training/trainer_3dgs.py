@@ -21,8 +21,20 @@ import json
 
 from ..models.gaussian_volume import GaussianVolume
 from ..models.slice_renderer import SliceRenderer
-from ..models.classical_interp import ClassicalInterpolator
+from ..models.classical_interp import (
+    ClassicalInterpolator,
+    interpolate_cubic_bm4d,
+    interpolate_sinc3d,
+    interpolate_unet_blend,
+)
 from ..losses.regularization import TotalLoss
+
+
+# Set of residual bases that require computing a dense 3D volume once,
+# rather than interpolating per-slice with the z-axis-only cubic helper.
+# These bases exploit x-y correlation / self-similarity or require a
+# trained network to query.
+VOLUME_LEVEL_BASES = {"cubic_bm4d", "sinc3d", "unet_blend"}
 
 
 class Trainer3DGS:
@@ -76,6 +88,10 @@ class Trainer3DGS:
         # ===== RESIDUAL MODE =====
         self.residual_mode = gs_config.get("residual_mode", False)
         self.residual_base = gs_config.get("residual_base", "cubic")
+        # Extra params for non-cubic bases
+        self.base_bm4d_sigma = float(gs_config.get("base_bm4d_sigma", 0.015))
+        self.base_unet_alpha = float(gs_config.get("base_unet_alpha", 0.5))
+        self.base_unet_predictor = gs_config.get("base_unet_predictor", None)
         self.loo_ratio = gs_config.get("loo_ratio", 0.0)
         self.loo_start = gs_config.get("loo_start", 0.6)  # Start LOO training at 60% progress
         if self.residual_mode:
@@ -113,6 +129,15 @@ class Trainer3DGS:
 
         init_mode = gs_config.get("init_mode", "grid")
         max_gs = gs_config.get("max_gaussians", 500000)
+        self.use_rotation = bool(gs_config.get("use_rotation", False))
+        self.rotation_warmup_frac = float(gs_config.get("rotation_warmup_frac", 0.3))
+        self.use_structure_tensor = bool(gs_config.get("use_structure_tensor", False))
+        if self.use_rotation:
+            print(
+                f"  *** ORIENTED GAUSSIANS ENABLED (quaternion rotation) ***\n"
+                f"      rotation_warmup_frac={self.rotation_warmup_frac:.2f}, "
+                f"structure_tensor_init={self.use_structure_tensor}"
+            )
 
         # Adaptive z-scale: cover inter-slice gaps based on sparse ratio
         sparse_ratio = self._infer_sparse_ratio(observed_indices)
@@ -131,6 +156,8 @@ class Trainer3DGS:
                 init_opacity=gs_config.get("init_opacity", 0.8),
                 max_gaussians=max_gs,
                 device=device,
+                use_rotation=self.use_rotation,
+                use_structure_tensor=self.use_structure_tensor,
             )
         else:
             self.gaussian_model = GaussianVolume.from_volume_grid(
@@ -142,6 +169,7 @@ class Trainer3DGS:
                 init_opacity=gs_config.get("init_opacity", 0.8),
                 max_gaussians=max_gs,
                 device=device,
+                use_rotation=self.use_rotation,
             )
 
         self.renderer = SliceRenderer(
@@ -159,12 +187,26 @@ class Trainer3DGS:
             lambda_fft=loss_config.get("lambda_fft", 0.0),
             fft_cutoff=loss_config.get("fft_cutoff", 0.3),
             lambda_residual=loss_config.get("lambda_residual", 0.0),
+            lambda_crossview=loss_config.get("lambda_crossview", 0.0),
             l1_weight=loss_config.get("l1_weight", 1.0),
             ssim_weight=loss_config.get("ssim_weight", 0.1),
             hu_gradient_weight=loss_config.get("hu_gradient_weight", False),
             hu_weight_max=loss_config.get("hu_weight_max", 3.0),
             multiscale=loss_config.get("multiscale", True),
         ).to(device)
+        self.crossview_interval = int(
+            loss_config.get("crossview_interval", 5)
+        )
+        self.crossview_window = int(
+            loss_config.get("crossview_window", 3)
+        )
+        # H3d: patch-based non-local prior (self-supervision at target z).
+        # lambda_patch=0 disables. Expected small (~0.01-0.05).
+        self.lambda_patch = float(loss_config.get("lambda_patch", 0.0))
+        self.patch_prior_k = int(loss_config.get("patch_prior_k", 5))
+        self.patch_prior_interval = int(
+            loss_config.get("patch_prior_interval", 5)
+        )
 
         # Training parameters with adaptive scaling for large volumes
         base_iters = gs_config.get("num_iterations", 5000)
@@ -218,10 +260,13 @@ class Trainer3DGS:
         # ===== PRECOMPUTE CUBIC/LINEAR BASE FOR RESIDUAL MODE =====
         self.cubic_cache = {}      # Full cubic base (all observed as control)
         self.loo_cache = {}        # LOO cubic base (leave-one-out per observed)
+        self.patch_prior_cache = {}  # H3d: target-z -> non-local prior tensor
         if self.residual_mode:
             self._precompute_residual_base()
             if self.loo_ratio > 0:
                 self._precompute_loo_base()
+        if self.lambda_patch > 0:
+            self._precompute_patch_priors()
 
         # For residual mode: initialize Gaussian intensities to zero
         # since we want the initial 3DGS output to be zero (pure cubic base)
@@ -239,6 +284,8 @@ class Trainer3DGS:
             "loss_edge": [],
             "loss_tv": [],
             "loss_fft": [],
+            "loss_crossview": [],
+            "loss_patch": [],
             "num_gaussians": [],
             "psnr_train": [],
             "lr_position": [],
@@ -249,29 +296,67 @@ class Trainer3DGS:
         self.aborted_early = False
 
     def _precompute_residual_base(self) -> None:
-        """Precompute full cubic/linear base for all slices.
+        """Precompute full residual base for all slices.
 
-        Uses ALL observed slices as control points (consistent train/inference).
-        At observed z-positions, cubic = GT exactly (Catmull-Rom property).
+        Supports multiple base types:
+        - 'cubic' / 'linear' / 'nearest': per-slice z-axis interpolation
+          (uses ALL observed slices as control points; cubic = GT at
+          observed positions by Catmull-Rom property).
+        - 'cubic_bm4d': cubic dense volume + BM4D 3D denoising; exploits
+          x-y non-local self-similarity beyond what cubic offers.
+        - 'sinc3d': FFT zero-pad along z; band-limited reconstruction.
+        - 'unet_blend': blend of cubic and a pretrained U-Net 2D predictor.
         """
         method = self.residual_base
         sorted_obs = np.sort(self.observed_indices)
 
-        all_z = set(int(z) for z in self.observed_indices)
-        all_z.update(int(z) for z in self.target_indices)
+        all_z = sorted(
+            set(int(z) for z in self.observed_indices)
+            | set(int(z) for z in self.target_indices)
+        )
 
         print(f"  Precomputing FULL {method} base for {len(all_z)} slices "
               f"(using {len(sorted_obs)} observed as control points)...")
 
         t_start = time.time()
 
-        for z_idx in sorted(all_z):
-            base_slice = ClassicalInterpolator.interpolate_target_slice(
-                self.volume, sorted_obs, z_idx, method
-            )
-            self.cubic_cache[z_idx] = torch.from_numpy(
-                base_slice
-            ).unsqueeze(0).float().to(self.device, non_blocking=True)
+        if method in VOLUME_LEVEL_BASES:
+            all_z_arr = np.array(all_z, dtype=np.int64)
+            if method == "cubic_bm4d":
+                dense, all_sorted = interpolate_cubic_bm4d(
+                    self.volume, sorted_obs, all_z_arr,
+                    sigma_psd=self.base_bm4d_sigma,
+                )
+            elif method == "sinc3d":
+                dense, all_sorted = interpolate_sinc3d(
+                    self.volume, sorted_obs, all_z_arr,
+                )
+            elif method == "unet_blend":
+                if self.base_unet_predictor is None:
+                    raise ValueError(
+                        "residual_base='unet_blend' requires base_unet_predictor "
+                        "(callable) in gaussian config. Got None."
+                    )
+                dense, all_sorted = interpolate_unet_blend(
+                    self.volume, sorted_obs, all_z_arr,
+                    unet_predictor=self.base_unet_predictor,
+                    blend_alpha=self.base_unet_alpha,
+                )
+            else:
+                raise ValueError(f"Unknown volume-level base: {method}")
+
+            for i, z_idx in enumerate(all_sorted):
+                self.cubic_cache[int(z_idx)] = torch.from_numpy(
+                    dense[:, :, i]
+                ).unsqueeze(0).float().to(self.device, non_blocking=True)
+        else:
+            for z_idx in all_z:
+                base_slice = ClassicalInterpolator.interpolate_target_slice(
+                    self.volume, sorted_obs, z_idx, method
+                )
+                self.cubic_cache[z_idx] = torch.from_numpy(
+                    base_slice
+                ).unsqueeze(0).float().to(self.device, non_blocking=True)
 
         if self.device == "cuda":
             torch.cuda.synchronize()
@@ -302,7 +387,17 @@ class Trainer3DGS:
         error at target z, enabling 3DGS to learn corrections that
         can exceed cubic quality at inference.
         """
-        method = self.residual_base
+        # LOO is inherently per-slice; for volume-level bases (BM4D/sinc3d/
+        # unet_blend) we would need N_obs dense reconstructions which is
+        # too expensive. Fallback to plain cubic LOO which is still a
+        # useful learning signal (the 3DGS still predicts corrections on
+        # top of the volume-level base at inference time).
+        method = "cubic" if self.residual_base in VOLUME_LEVEL_BASES else self.residual_base
+        if self.residual_base in VOLUME_LEVEL_BASES:
+            print(
+                f"  [LOO] residual_base='{self.residual_base}' uses dense 3D "
+                f"reconstruction; LOO fallback method = 'cubic'"
+            )
         sorted_obs = np.sort(self.observed_indices)
 
         print(f"  Precomputing LOO {method} base for {len(sorted_obs)} observed slices...")
@@ -341,6 +436,87 @@ class Trainer3DGS:
         print(f"  LOO residual stats: mean_abs={avg_loo:.6f}, max_abs={max_loo:.6f}")
         print(f"  (LOO residuals are nonzero -> 3DGS learns meaningful corrections)")
 
+    def _precompute_patch_priors(self) -> None:
+        """H3d: precompute non-local patch prior for each target slice.
+
+        For every target z, find the top-k most similar observed slices
+        (similarity = -L1 distance on downsampled grayscale, combined with
+        inverse z-distance weight). The prior is the softmax-weighted mean
+        of those neighbors. This captures non-local self-similarity (a la
+        NL-means / BM4D) without requiring BM4D on the full volume.
+
+        The prior is used as an auxiliary self-supervision target during
+        training: predictions at target z are regularized to match it with
+        weight `lambda_patch`. This injects x-y correlation information
+        that the base cubic interpolation cannot provide.
+        """
+        if not self.target_indices:
+            return
+        sorted_obs = np.sort(self.observed_indices)
+        if len(sorted_obs) < 2:
+            return
+        H, W = self.volume.shape[1], self.volume.shape[2]
+        # Downsample to 64x64 for cheap similarity scoring.
+        ds = 64 if min(H, W) > 64 else min(H, W)
+        stride_h = max(1, H // ds)
+        stride_w = max(1, W // ds)
+        obs_tensor = torch.stack(
+            [self.observed_slices[int(z)] for z in sorted_obs], dim=0
+        ).squeeze(1)  # (N_obs, H, W)
+        obs_ds = obs_tensor[:, ::stride_h, ::stride_w].reshape(
+            len(sorted_obs), -1
+        )  # (N_obs, D)
+        k = min(self.patch_prior_k, len(sorted_obs))
+        z_obs_t = torch.from_numpy(sorted_obs).float().to(self.device)
+
+        print(
+            f"  [H3d] Precomputing patch priors for {len(self.target_indices)} "
+            f"target slices (k={k})..."
+        )
+        t_start = time.time()
+
+        # For a robust similarity feature, blur slightly.
+        obs_ds_norm = obs_ds - obs_ds.mean(dim=1, keepdim=True)
+        obs_ds_norm = obs_ds_norm / (
+            obs_ds_norm.std(dim=1, keepdim=True).clamp(min=1e-6)
+        )
+
+        for z_tgt in self.target_indices:
+            z_tgt_i = int(z_tgt)
+            # z-gap based prior: closer obs slices get higher weight.
+            z_gaps = (z_obs_t - float(z_tgt_i)).abs()
+            # Use a soft feature target: cubic base at target z (already cached
+            # for residual mode) or linear average of nearest neighbors.
+            if z_tgt_i in self.cubic_cache:
+                anchor = self.cubic_cache[z_tgt_i].squeeze(0)
+            else:
+                # Nearest-neighbor average fallback.
+                nearest = torch.argsort(z_gaps)[:2]
+                anchor = obs_tensor[nearest].mean(dim=0)
+            anchor_ds = anchor[::stride_h, ::stride_w].reshape(-1)
+            anchor_ds = anchor_ds - anchor_ds.mean()
+            anchor_ds = anchor_ds / anchor_ds.std().clamp(min=1e-6)
+            # Cosine similarity (higher = more similar).
+            sim = (obs_ds_norm * anchor_ds.unsqueeze(0)).mean(dim=1)
+            # Distance penalty: exp(-gap / sigma)
+            sigma = max(2.0, float(self.sparse_ratio) * 2.0)
+            z_weight = torch.exp(-z_gaps / sigma)
+            score = sim * z_weight
+            topk_idx = torch.topk(score, k).indices
+            topk_w = torch.softmax(score[topk_idx] * 4.0, dim=0)  # temperature
+            prior = (obs_tensor[topk_idx] * topk_w.view(-1, 1, 1)).sum(dim=0)
+            self.patch_prior_cache[z_tgt_i] = prior.unsqueeze(0).to(
+                self.device, non_blocking=True
+            )
+
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.time() - t_start
+        print(
+            f"  [H3d] Patch priors cached for {len(self.patch_prior_cache)} "
+            f"targets in {elapsed:.1f}s"
+        )
+
     @staticmethod
     def _infer_sparse_ratio(observed_indices: np.ndarray) -> int:
         """Infer the sparse ratio from observed slice indices."""
@@ -372,7 +548,7 @@ class Trainer3DGS:
 
     def _setup_optimizer(self, gs_config: Dict) -> None:
         """Setup optimizer with per-parameter learning rates."""
-        self.optimizer = torch.optim.Adam([
+        groups = [
             {
                 "params": [self.gaussian_model.positions],
                 "lr": gs_config.get("lr_position", 0.01),
@@ -393,7 +569,15 @@ class Trainer3DGS:
                 "lr": gs_config.get("lr_intensity", 0.005),
                 "name": "intensity",
             },
-        ])
+        ]
+        if self.use_rotation:
+            groups.append({
+                "params": [self.gaussian_model.rotation],
+                # Rotation LR starts at 0 and ramps up after warmup
+                "lr": 0.0,
+                "name": "rotation",
+            })
+        self.optimizer = torch.optim.Adam(groups)
 
     def _rebuild_optimizer(self, gs_config: Dict = None) -> None:
         """Rebuild optimizer after densification/pruning changes parameters."""
@@ -403,7 +587,7 @@ class Trainer3DGS:
             for group in self.optimizer.param_groups:
                 gs_config[f"lr_{group['name']}"] = group["lr"]
 
-        self.optimizer = torch.optim.Adam([
+        groups = [
             {
                 "params": [self.gaussian_model.positions],
                 "lr": gs_config.get("lr_position", gs_config.get("lr_positions", 0.01)),
@@ -424,7 +608,37 @@ class Trainer3DGS:
                 "lr": gs_config.get("lr_intensity", 0.005),
                 "name": "intensity",
             },
-        ])
+        ]
+        if self.use_rotation:
+            groups.append({
+                "params": [self.gaussian_model.rotation],
+                "lr": gs_config.get("lr_rotation", 0.0),
+                "name": "rotation",
+            })
+        self.optimizer = torch.optim.Adam(groups)
+
+    def _update_rotation_lr(self, iteration: int) -> None:
+        """Enable rotation learning only after warmup phase.
+
+        Initially Gaussians train with frozen identity rotation; after
+        `rotation_warmup_frac` of total iterations, the rotation LR is
+        ramped up so position/scale/opacity have first converged.
+        """
+        if not self.use_rotation:
+            return
+        warmup_iter = int(self.rotation_warmup_frac * self.num_iterations)
+        target_lr = float(self._gs_config.get("lr_rotation", 0.001))
+        if iteration < warmup_iter:
+            new_lr = 0.0
+        else:
+            ramp = min(
+                1.0,
+                (iteration - warmup_iter) / max(1, warmup_iter),
+            )
+            new_lr = target_lr * ramp
+        for group in self.optimizer.param_groups:
+            if group.get("name") == "rotation":
+                group["lr"] = new_lr
 
     def _get_training_target(self, z_idx: int) -> torch.Tensor:
         """Get the training target for a given slice index.
@@ -486,6 +700,7 @@ class Trainer3DGS:
 
         for iteration in range(self.num_iterations):
             self._update_learning_rate(iteration)
+            self._update_rotation_lr(iteration)
 
             # Regularization annealing: coarse-to-fine
             progress = iteration / max(1, self.num_iterations - 1)
@@ -501,6 +716,8 @@ class Trainer3DGS:
             sum_edge = 0.0
             sum_tv = 0.0
             sum_fft = 0.0
+            sum_crossview = 0.0
+            sum_patch = 0.0
             last_psnr = 0.0
             # Track if any slice in this iteration successfully produced a
             # scaled backward pass. GradScaler.step() asserts that at least
@@ -529,12 +746,14 @@ class Trainer3DGS:
 
                 with autocast(enabled=self.mixed_precision):
                     params = self.gaussian_model.get_params()
+                    rot_param = params.get("rotation")
                     rendered = self.renderer(
                         params["positions"],
                         params["scales"],
                         params["opacity"],
                         params["intensity"],
                         float(z_idx),
+                        rotation=rot_param,
                     )
 
                     # In residual mode: compose full prediction for loss
@@ -558,6 +777,7 @@ class Trainer3DGS:
                                 params["opacity"],
                                 params["intensity"],
                                 float(neighbor_z),
+                                rotation=rot_param,
                             )
                             if self.residual_mode:
                                 adjacent_pred = self._compose_prediction(
@@ -572,9 +792,55 @@ class Trainer3DGS:
                     if self.residual_mode and not slice_use_loo:
                         res_out = rendered
 
+                    # Cross-view consistency (H3b): render a short z-stack
+                    # around this slice and compare with base's z-stack. Only
+                    # runs every `crossview_interval` iterations to control
+                    # extra render cost.
+                    cv_pred_stack = None
+                    cv_base_stack = None
+                    if (
+                        self.criterion.lambda_crossview > 0
+                        and iteration % self.crossview_interval == 0
+                        and self.residual_mode
+                        and len(self.cubic_cache) > 0
+                    ):
+                        K = max(1, self.crossview_window // 2)
+                        stack_zs = [z_idx + k for k in range(-K, K + 1)]
+                        stack_zs = [
+                            z for z in stack_zs
+                            if z in self.cubic_cache
+                        ]
+                        if len(stack_zs) >= 2:
+                            pred_list = []
+                            base_list = []
+                            for zz in stack_zs:
+                                if zz == z_idx:
+                                    pred_list.append(prediction.squeeze(0))
+                                else:
+                                    ren = self.renderer(
+                                        params["positions"],
+                                        params["scales"],
+                                        params["opacity"],
+                                        params["intensity"],
+                                        float(zz),
+                                        rotation=rot_param,
+                                    )
+                                    pred_list.append(
+                                        self._compose_prediction(
+                                            ren, zz, use_loo=False
+                                        ).squeeze(0)
+                                    )
+                                base_list.append(
+                                    self.cubic_cache[zz].squeeze(0)
+                                )
+                            cv_pred_stack = torch.stack(pred_list, dim=0)
+                            cv_base_stack = torch.stack(base_list, dim=0)
+
                     loss_dict = self.criterion(
                         prediction, gt_slice, adjacent_pred, adjacent_gt,
                         residual_output=res_out,
+                        crossview_pred_stack=cv_pred_stack,
+                        crossview_base_stack=cv_base_stack,
                     )
                     slice_loss = loss_dict["total"] / B
 
@@ -608,6 +874,8 @@ class Trainer3DGS:
                 sum_edge += loss_dict["edge"].item()
                 sum_tv += loss_dict["tv"].item()
                 sum_fft += loss_dict["fft"].item()
+                if "crossview" in loss_dict:
+                    sum_crossview = sum_crossview + loss_dict["crossview"].item()
 
                 # Track error for error-map densification
                 if self.use_error_map:
@@ -628,6 +896,48 @@ class Trainer3DGS:
             if self.aborted_early:
                 break
 
+            # H3d: patch-prior self-supervision at target z.
+            # Every `patch_prior_interval` iterations, render a random target
+            # slice and push it toward the non-local patch prior with a small
+            # weight. This injects x-y correlation information that the base
+            # interpolation cannot provide.
+            if (
+                self.lambda_patch > 0
+                and len(self.patch_prior_cache) > 0
+                and iteration % self.patch_prior_interval == 0
+                and did_backward
+            ):
+                try:
+                    target_zs = list(self.patch_prior_cache.keys())
+                    z_patch = int(np.random.choice(target_zs))
+                    rot_param = (
+                        self.gaussian_model.rotation if self.use_rotation else None
+                    )
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        params_p = self.gaussian_model.get_params()
+                        ren_p = self.renderer(
+                            params_p["positions"],
+                            params_p["scales"],
+                            params_p["opacity"],
+                            params_p["intensity"],
+                            float(z_patch),
+                            rotation=rot_param,
+                        )
+                        pred_p = self._compose_prediction(
+                            ren_p, z_patch, use_loo=False
+                        )
+                        prior_p = self.patch_prior_cache[z_patch]
+                        # L1 to the prior, weighted down.
+                        patch_loss = self.lambda_patch * torch.nn.functional.l1_loss(
+                            pred_p, prior_p
+                        )
+                    if torch.isfinite(patch_loss) and patch_loss.grad_fn is not None:
+                        self.scaler.scale(patch_loss).backward()
+                        sum_patch += patch_loss.item()
+                except Exception as e:
+                    if iteration % 200 == 0:
+                        print(f"  [H3d] patch-prior step failed: {e}")
+
             # Skip optimizer step entirely if no backward was successfully
             # recorded this iteration (all slices produced NaN/Inf).
             # GradScaler would otherwise raise:
@@ -639,16 +949,23 @@ class Trainer3DGS:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
+            # Keep quaternions unit-norm (prevents drift after Adam updates)
+            if self.use_rotation and iteration % 20 == 0:
+                self.gaussian_model.normalize_quaternions()
+
             # Sanitize parameters if AMP overflow / underflow leaked NaNs into them.
             # Resets affected entries to a benign value so subsequent iterations can
             # continue rather than silently produce NaN renderings.
             with torch.no_grad():
-                for p in (
+                sanitize_list = [
                     self.gaussian_model.positions,
                     self.gaussian_model.log_scales,
                     self.gaussian_model.raw_opacity,
                     self.gaussian_model.intensity,
-                ):
+                ]
+                if self.use_rotation:
+                    sanitize_list.append(self.gaussian_model.rotation)
+                for p in sanitize_list:
                     if not torch.isfinite(p).all():
                         p.nan_to_num_(nan=0.0, posinf=1.0, neginf=-1.0)
 
@@ -661,6 +978,8 @@ class Trainer3DGS:
                 self.history["loss_edge"].append(sum_edge / B)
                 self.history["loss_tv"].append(sum_tv / B)
                 self.history["loss_fft"].append(sum_fft / B)
+                self.history["loss_crossview"].append(sum_crossview / B)
+                self.history["loss_patch"].append(sum_patch)
                 self.history["num_gaussians"].append(
                     self.gaussian_model.num_gaussians
                 )
@@ -764,6 +1083,7 @@ class Trainer3DGS:
         n_targets = len(self.target_indices)
         results = np.zeros((self.H, self.W, n_targets), dtype=np.float32)
 
+        rot_param = params.get("rotation")
         batch_size = 16
         for start in range(0, n_targets, batch_size):
             end = min(start + batch_size, n_targets)
@@ -776,6 +1096,7 @@ class Trainer3DGS:
                     params["opacity"],
                     params["intensity"],
                     float(z_idx),
+                    rotation=rot_param,
                 )
                 # In residual mode: add cubic base
                 if self.residual_mode and z_idx in self.cubic_cache:
@@ -802,6 +1123,7 @@ class Trainer3DGS:
         params = self.gaussian_model.get_params()
 
         volume = np.zeros((self.H, self.W, self.D), dtype=np.float32)
+        rot_param = params.get("rotation")
 
         for z_idx in range(self.D):
             rendered = self.renderer(
@@ -810,6 +1132,7 @@ class Trainer3DGS:
                 params["opacity"],
                 params["intensity"],
                 float(z_idx),
+                rotation=rot_param,
             )
             # In residual mode: add cubic base if available
             if self.residual_mode and z_idx in self.cubic_cache:
@@ -869,11 +1192,13 @@ class Trainer3DGS:
     def save_checkpoint(self, filename: str) -> None:
         """Save training checkpoint."""
         path = self.checkpoint_dir / filename
-        torch.save({
+        payload = {
             "positions": self.gaussian_model.positions.data.cpu(),
             "log_scales": self.gaussian_model.log_scales.data.cpu(),
             "raw_opacity": self.gaussian_model.raw_opacity.data.cpu(),
             "intensity": self.gaussian_model.intensity.data.cpu(),
+            "rotation": self.gaussian_model.rotation.data.cpu(),
+            "use_rotation": self.gaussian_model.use_rotation,
             "volume_shape": self.volume.shape,
             "observed_indices": self.observed_indices,
             "target_indices": self.target_indices,
@@ -881,7 +1206,8 @@ class Trainer3DGS:
             "history": self.history,
             "residual_mode": self.residual_mode,
             "residual_base": self.residual_base,
-        }, path)
+        }
+        torch.save(payload, path)
 
     def load_checkpoint(self, filename: str) -> None:
         """Load training checkpoint."""
@@ -889,8 +1215,10 @@ class Trainer3DGS:
         checkpoint = torch.load(path, map_location=self.device)
 
         n = checkpoint["positions"].shape[0]
+        has_rotation = checkpoint.get("use_rotation", False)
         self.gaussian_model = GaussianVolume(
-            n, checkpoint["volume_shape"], self.device
+            n, checkpoint["volume_shape"], self.device,
+            use_rotation=has_rotation,
         )
         with torch.no_grad():
             self.gaussian_model.positions.data = checkpoint["positions"].to(
@@ -905,6 +1233,10 @@ class Trainer3DGS:
             self.gaussian_model.intensity.data = checkpoint["intensity"].to(
                 self.device
             )
+            if "rotation" in checkpoint:
+                self.gaussian_model.rotation.data = checkpoint["rotation"].to(
+                    self.device
+                )
 
         if "history" in checkpoint:
             self.history = checkpoint["history"]
