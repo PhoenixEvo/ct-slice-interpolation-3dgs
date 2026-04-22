@@ -165,7 +165,12 @@ class CTORGLoader:
             return None
 
         nii = nib.load(str(label_path))
-        labels = nii.get_fdata().astype(np.int32)
+        # CT-ORG stores label IDs as int16 but nibabel's NIfTI scaling can
+        # return them as floats slightly below the integer (e.g. 4.9999...
+        # for 5). A direct .astype(int32) then truncates toward zero and
+        # silently merges labels (e.g. liver's value 1 -> 0 == background).
+        # Round first to preserve the original integer IDs.
+        labels = np.round(nii.get_fdata()).astype(np.int32)
         return labels
 
     def preprocess_volume(self, volume: np.ndarray) -> np.ndarray:
