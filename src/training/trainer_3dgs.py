@@ -140,10 +140,10 @@ class Trainer3DGS:
             )
 
         # Adaptive z-scale: cover inter-slice gaps based on sparse ratio
-        sparse_ratio = self._infer_sparse_ratio(observed_indices)
+        self.sparse_ratio = self._infer_sparse_ratio(observed_indices)
         base_scale_z = gs_config.get("init_scale_z", 1.0)
-        adaptive_scale_z = max(base_scale_z, sparse_ratio * 0.6)
-        print(f"  Sparse ratio ~{sparse_ratio}, init_scale_z: {base_scale_z} -> {adaptive_scale_z:.2f}")
+        adaptive_scale_z = max(base_scale_z, self.sparse_ratio * 0.6)
+        print(f"  Sparse ratio ~{self.sparse_ratio}, init_scale_z: {base_scale_z} -> {adaptive_scale_z:.2f}")
 
         if init_mode == "adaptive":
             self.gaussian_model = GaussianVolume.from_volume_adaptive(
@@ -217,6 +217,15 @@ class Trainer3DGS:
         if self.num_iterations != base_iters:
             print(f"  Adaptive iterations: {base_iters} x {iter_scale:.2f} = {self.num_iterations} "
                   f"(volume has {num_obs} observed slices)")
+        # Optional hard cap on iterations (applied AFTER adaptive scaling).
+        # 0 (default) = no cap, preserves historical behavior.
+        iters_cap = int(gs_config.get("num_iterations_cap", 0) or 0)
+        if iters_cap > 0 and self.num_iterations > iters_cap:
+            print(
+                f"  Iterations capped: {self.num_iterations} -> {iters_cap} "
+                f"(num_iterations_cap={iters_cap})"
+            )
+            self.num_iterations = iters_cap
         self.warmup_iterations = gs_config.get("warmup_iterations", 200)
         self.densify_interval = gs_config.get("densify_interval", 100)
         self.densify_grad_threshold = gs_config.get(
@@ -913,7 +922,7 @@ class Trainer3DGS:
                     rot_param = (
                         self.gaussian_model.rotation if self.use_rotation else None
                     )
-                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    with torch.cuda.amp.autocast(enabled=self.mixed_precision):
                         params_p = self.gaussian_model.get_params()
                         ren_p = self.renderer(
                             params_p["positions"],
