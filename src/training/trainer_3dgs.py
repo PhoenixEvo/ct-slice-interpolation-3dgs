@@ -450,7 +450,7 @@ class Trainer3DGS:
         weight `lambda_patch`. This injects x-y correlation information
         that the base cubic interpolation cannot provide.
         """
-        if not self.target_indices:
+        if len(self.target_indices) == 0:
             return
         sorted_obs = np.sort(self.observed_indices)
         if len(sorted_obs) < 2:

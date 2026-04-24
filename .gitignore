@@ -89,6 +89,8 @@ comparison.txt
 *.pdf
 *.pptx
 *.png
+modal_runs/
+modal_app.py
 # Results and figures (optional - uncomment if you don't want to commit)
 # results/
 # figures/
