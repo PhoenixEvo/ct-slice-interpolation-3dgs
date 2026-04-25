@@ -281,20 +281,9 @@ def interpolate_cubic_bm4d(
 
     denoised = None
     try:
-        import bm4d  # type: ignore
-
-        # BM4D expects (D1, D2, D3); use as-is since it is shape-agnostic
-        denoised = bm4d.bm4d(
-            dense,
-            sigma_psd=sigma_psd,
-            profile=profile,
-        ).astype(np.float32)
-        print(f"  [cubic_bm4d] BM4D denoise applied (sigma={sigma_psd}, profile={profile})")
-    except Exception as exc:
-        print(
-            f"  [cubic_bm4d] bm4d unavailable ({type(exc).__name__}); "
-            f"falling back to skimage non-local means 3D"
-        )
+        from bm4d import bm4d  # type: ignore
+    except ImportError:
+        print("  [cubic_bm4d] bm4d not installed; falling back to skimage non-local means 3D")
         try:
             from skimage.restoration import denoise_nl_means, estimate_sigma
 
@@ -319,6 +308,14 @@ def interpolate_cubic_bm4d(
                 f"returning plain cubic as fallback"
             )
             denoised = dense
+    else:
+        # BM4D expects (D1, D2, D3); use as-is since it is shape-agnostic
+        denoised = bm4d(
+            dense.astype("float32", copy=False),
+            sigma_psd=sigma_psd,
+            profile=profile,
+        ).astype(np.float32)
+        print(f"  [cubic_bm4d] BM4D denoise applied (sigma={sigma_psd}, profile={profile})")
 
     # Critical: preserve observed slices exactly (they are ground truth,
     # we must not denoise them away). Only target z positions get denoised.
