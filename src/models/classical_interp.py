@@ -266,7 +266,9 @@ def interpolate_cubic_bm4d(
         sigma_psd: Noise-like residual std for the denoiser (tuned small
             because the "noise" here is cubic interpolation error, not
             actual imaging noise).
-        profile: BM4D profile, "lc" = low complexity (faster), "np" = normal.
+        profile: BM4D profile. "lc" is kept as a backward-compatible alias
+            and mapped to "np" for bm4d versions that only accept
+            {"np", "refilter"} or a BM4DProfile object.
 
     Returns:
         (dense_volume, sorted_indices) where dense_volume has shape
@@ -310,12 +312,16 @@ def interpolate_cubic_bm4d(
             denoised = dense
     else:
         # BM4D expects (D1, D2, D3); use as-is since it is shape-agnostic
+        bm4d_profile = "np" if profile == "lc" else profile
         denoised = bm4d(
             dense.astype("float32", copy=False),
             sigma_psd=sigma_psd,
-            profile=profile,
+            profile=bm4d_profile,
         ).astype(np.float32)
-        print(f"  [cubic_bm4d] BM4D denoise applied (sigma={sigma_psd}, profile={profile})")
+        print(
+            f"  [cubic_bm4d] BM4D denoise applied "
+            f"(sigma={sigma_psd}, profile={bm4d_profile})"
+        )
 
     # Critical: preserve observed slices exactly (they are ground truth,
     # we must not denoise them away). Only target z positions get denoised.
