@@ -826,19 +826,25 @@ class Trainer3DGS:
                                 if zz == z_idx:
                                     pred_list.append(prediction.squeeze(0))
                                 else:
-                                    ren = self.renderer(
-                                        params["positions"],
-                                        params["scales"],
-                                        params["opacity"],
-                                        params["intensity"],
-                                        float(zz),
-                                        rotation=rot_param,
-                                    )
-                                    pred_list.append(
-                                        self._compose_prediction(
-                                            ren, zz, use_loo=False
-                                        ).squeeze(0)
-                                    )
+                                    # Detach neighbor renders to avoid OOM:
+                                    # each extra render retains ~3 GB of
+                                    # intermediates in the computation graph.
+                                    # Gradient still flows through the current
+                                    # slice's prediction in the stack.
+                                    with torch.no_grad():
+                                        ren = self.renderer(
+                                            params["positions"],
+                                            params["scales"],
+                                            params["opacity"],
+                                            params["intensity"],
+                                            float(zz),
+                                            rotation=rot_param,
+                                        )
+                                        pred_list.append(
+                                            self._compose_prediction(
+                                                ren, zz, use_loo=False
+                                            ).squeeze(0)
+                                        )
                                 base_list.append(
                                     self.cubic_cache[zz].squeeze(0)
                                 )
@@ -1154,12 +1160,18 @@ class Trainer3DGS:
 
     @torch.no_grad()
     def evaluate_on_targets(
-        self, organ_labels: Optional[Dict[str, int]] = None
+        self,
+        organ_labels: Optional[Dict[str, int]] = None,
+        compute_perceptual: bool = False,
+        lpips_device: str = "cpu",
     ) -> Dict:
         """Evaluate interpolation quality on target slices.
 
         Args:
             organ_labels: Optional organ label mapping for ROI metrics.
+            compute_perceptual: If True, also computes H4 metrics
+                (LPIPS/HFEN/GMSD) in evaluate_volume.
+            lpips_device: Device for LPIPS network ("cpu" or "cuda").
 
         Returns:
             Dictionary with per-slice and aggregated metrics.
@@ -1182,6 +1194,8 @@ class Trainer3DGS:
             self.target_indices,
             labels=self.labels,
             organ_labels=organ_labels,
+            compute_perceptual=compute_perceptual,
+            lpips_device=lpips_device,
         )
 
         result["summary"]["inference_time_s"] = inference_time

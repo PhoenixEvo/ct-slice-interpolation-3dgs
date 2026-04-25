@@ -395,7 +395,10 @@ class TrainerTriPlane:
 
     @torch.no_grad()
     def evaluate_on_targets(
-        self, organ_labels: Optional[Dict[str, int]] = None
+        self,
+        organ_labels: Optional[Dict[str, int]] = None,
+        compute_perceptual: bool = False,
+        lpips_device: str = "cpu",
     ) -> Dict:
         from ..evaluation.metrics import evaluate_volume
 
@@ -415,6 +418,8 @@ class TrainerTriPlane:
             self.target_indices,
             labels=self.labels,
             organ_labels=organ_labels,
+            compute_perceptual=compute_perceptual,
+            lpips_device=lpips_device,
         )
         result["summary"]["inference_time_s"] = inference_time
         result["summary"]["training_time_s"] = float(self.training_time)
