@@ -1235,7 +1235,7 @@ class Trainer3DGS:
     def load_checkpoint(self, filename: str) -> None:
         """Load training checkpoint."""
         path = self.checkpoint_dir / filename
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         n = checkpoint["positions"].shape[0]
         has_rotation = checkpoint.get("use_rotation", False)

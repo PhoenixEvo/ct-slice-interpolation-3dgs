@@ -206,8 +206,10 @@ class SliceRenderer(nn.Module):
         eye2 = torch.eye(2, device=Sigma_cond.device, dtype=Sigma_cond.dtype)
         Sigma_cond = Sigma_cond + 1e-6 * eye2
 
-        # Per-Gaussian inverse (K, 2, 2) and marginal z weight
-        Sigma_inv = torch.linalg.inv(Sigma_cond)
+        # Per-Gaussian inverse (K, 2, 2) and marginal z weight.
+        # torch.linalg.inv does not support float16 on CUDA, so perform the
+        # inversion in float32 and cast back to the active dtype.
+        Sigma_inv = torch.linalg.inv(Sigma_cond.float()).to(Sigma_cond.dtype)
         z_weight = torch.exp(-0.5 * z_diff * z_diff / cov_zz_a)  # (K,)
         eff_weight = opacity_a * z_weight
 
