@@ -79,6 +79,48 @@ All numbers below are aggregated **directly from the per-case JSON / `summary.cs
 | Δ GMSD vs Cubic (best 3DGS variant) | **−0.00018** ✓ | **−0.00021** ✓ | **−0.00022** ✓ |
 | 3DGS+Patch LPIPS vs 3DGS Std | **−0.0003** ✓ | **−0.0002** ✓ | **−0.0001** ✓ |
 
+### Per-Organ ROI Results (PSNR dB, 19 labeled cases)
+
+Computed within CT-ORG segmentation masks (liver=1, kidneys=4, lungs=3, bladder=2, bone=5).
+
+#### R=2
+
+| Method | Liver | Kidneys | Lungs | Bladder | Bone |
+|--------|:-----:|:-------:|:-----:|:-------:|:----:|
+| 3DGS+Patch (Ours) | 42.65 | 41.29 | 37.88 | 41.60 | 35.43 |
+| 3DGS Std | 42.67 | 41.25 | 37.91 | 41.64 | 35.39 |
+| 3DGS High | 42.82 | 41.37 | 37.97 | 41.74 | 35.45 |
+| U-Net 2D | 42.58 | 40.69 | 37.17 | 41.56 | 33.87 |
+| **Cubic** | **43.33** | **41.76** | **38.23** | **42.13** | **35.56** |
+| Linear | 42.57 | 41.06 | 36.12 | 41.59 | 33.59 |
+| Nearest | 38.31 | 36.19 | 27.33 | 37.16 | 26.34 |
+
+#### R=3
+
+| Method | Liver | Kidneys | Lungs | Bladder | Bone |
+|--------|:-----:|:-------:|:-----:|:-------:|:----:|
+| 3DGS+Patch (Ours) | 39.23 | 37.96 | 32.93 | 38.30 | 30.49 |
+| 3DGS Std | 39.27 | 37.99 | 32.96 | 38.34 | 30.49 |
+| 3DGS High | 39.27 | 37.99 | 32.96 | 38.35 | 30.49 |
+| U-Net 2D | 38.75 | 36.49 | 30.49 | 37.85 | 28.45 |
+| **Cubic** | **39.45** | **38.10** | **33.00** | 38.47 | **30.50** |
+| Linear | 39.23 | 37.86 | 32.01 | **38.51** | 29.61 |
+| Nearest | 38.11 | 36.28 | 27.66 | 37.27 | 26.35 |
+
+#### R=4
+
+| Method | Liver | Kidneys | Lungs | Bladder | Bone |
+|--------|:-----:|:-------:|:-----:|:-------:|:----:|
+| 3DGS+Patch (Ours) | 37.30 | 36.23 | 30.01 | 36.57 | 27.68 |
+| 3DGS Std | 37.27 | 36.18 | 30.02 | 36.56 | 27.67 |
+| 3DGS High | 37.31 | 36.26 | 30.00 | 36.57 | **27.69** |
+| **U-Net 2D** | **37.59** | 35.61 | 27.89 | 36.63 | 26.20 |
+| Cubic | 37.45 | **36.34** | **30.04** | 36.71 | 27.69 |
+| Linear | 37.36 | 36.23 | 29.50 | **36.93** | 27.23 |
+| Nearest | 36.74 | 34.76 | 25.84 | 36.00 | 24.77 |
+
+> **ROI insight**: 3DGS closely tracks cubic across all organs. At R=4, U-Net achieves the highest liver PSNR (37.59 dB), suggesting supervised methods better exploit organ-specific learned priors for large homogeneous organs. However, U-Net's lungs PSNR degrades sharply (27.89 vs 30.04 cubic), indicating difficulty with high-contrast air-tissue boundaries.
+
 ## Key Contributions
 
 - **Residual 3DGS**: Novel formulation where 3DGS predicts a residual correction on top of cubic interpolation, achieving near-cubic quality while enabling fine-detail learning
