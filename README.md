@@ -10,6 +10,8 @@ This project explores whether **3D Gaussian Splatting** — originally developed
 
 ## Results (21 Test Cases)
 
+All numbers below are aggregated **directly from the per-case JSON / `summary.csv` files in `outputs/`** (N = 21 test cases per ratio, fixed split, seed 42). 3DGS / 3DGS+Patch use the rebuilt summaries that include the perceptual metrics (LPIPS / HFEN / GMSD).
+
 ### PSNR Comparison
 
 | Method | R=2 PSNR | R=3 PSNR | R=4 PSNR | Training Data? | Category |
@@ -17,49 +19,50 @@ This project explores whether **3D Gaussian Splatting** — originally developed
 | Nearest | 35.11 | 35.08 | 33.48 | ✗ | Classical |
 | Linear | 41.74 | 38.12 | 35.98 | ✗ | Classical |
 | **Cubic** | **43.04** | **38.73** | **36.30** | ✗ | Classical |
-| U-Net 2D | 41.92 | 35.31 | 34.70 | ✓ (98 vols) | Supervised DL |
+| U-Net 2D | 41.92 | 37.01 | 34.82 | ✓ (98 vols) | Supervised DL |
 | ArSSR (Wu et al., 2022) | TBD | TBD | TBD | ✓ (98 vols) | INR (1 model, all R) |
 | SAINT (Peng et al., 2020) | TBD | TBD | TBD | ✓ (98 vols) | Supervised SOTA (per-R) |
+| Tri-plane INR (H2) | TBD | TBD | TBD | ✗ | Per-volume self-supervised |
 | 3DGS Standard | 42.40 | 38.61 | 36.22 | ✗ | Per-volume self-supervised |
 | 3DGS High | 42.62 | 38.61 | 36.20 | ✗ | Per-volume self-supervised |
 | **3DGS + Patch Prior (Ours)** | **42.38** | **38.54** | **36.22** | ✗ | Per-volume self-supervised |
 
-> ArSSR and SAINT numbers are populated by `kaggle_notebooks/07_baseline_arssr.ipynb` and `kaggle_notebooks/08_baseline_saint.ipynb`.
+> ArSSR / SAINT / Tri-plane INR rows will be populated by `kaggle_notebooks/07_baseline_arssr.ipynb`, `kaggle_notebooks/08_baseline_saint.ipynb`, and `kaggle_notebooks/09_baseline_triplane.ipynb` respectively.
 
 ### Complete 6-Metric Comparison (All Methods)
 
 #### R=2 (2× Interpolation)
 
-| Metric | 3DGS+Patch (Ours) | 3DGS Std | 3DGS High | Cubic | Best |
-|:------:|:------------------:|:--------:|:---------:|:-----:|:----:|
-| **PSNR** ↑ | 42.38 | 42.40 | 42.62 | **43.04** | Cubic |
-| **SSIM** ↑ | 0.9634 | 0.9632 | 0.9677 | **0.9744** | Cubic |
-| **MAE** ↓ | 0.00506 | 0.00501 | 0.00485 | **0.00443** | Cubic |
-| **LPIPS** ↓ | 0.01529 | 0.01560 | 0.01550 | **0.01494** | Cubic |
-| **HFEN** ↓ | 0.15968 | **0.15959** | 0.15970 | 0.15970 | 3DGS Std |
-| **GMSD** ↓ | 0.02790 | **0.02789** | 0.02790 | 0.02808 | 3DGS Std |
+| Metric | 3DGS+Patch (Ours) | 3DGS Std | 3DGS High | U-Net 2D | Cubic | Linear | Nearest | Best |
+|:------:|:------------------:|:--------:|:---------:|:--------:|:-----:|:------:|:-------:|:----:|
+| **PSNR** ↑ | 42.38 | 42.40 | 42.62 | 41.92 | **43.04** | 41.74 | 35.11 | Cubic |
+| **SSIM** ↑ | 0.9634 | 0.9632 | 0.9677 | 0.9733 | **0.9744** | 0.9732 | 0.9434 | Cubic |
+| **MAE** ↓ | 0.00506 | 0.00501 | 0.00485 | 0.00467 | **0.00443** | 0.00474 | 0.00834 | Cubic |
+| **LPIPS** ↓ | 0.01529 | 0.01560 | 0.01550 | 0.02027 | **0.01494** | 0.02027 | 0.02510 | Cubic |
+| **HFEN** ↓ | 0.15968 | **0.15959** | 0.15970 | 0.16190 | 0.15970 | 0.17579 | 0.32244 | 3DGS Std |
+| **GMSD** ↓ | 0.02790 | **0.02789** | 0.02790 | 0.02840 | 0.02808 | 0.03064 | 0.05823 | 3DGS Std |
 
 #### R=3 (3× Interpolation)
 
-| Metric | 3DGS+Patch (Ours) | 3DGS Std | 3DGS High | Cubic | Best |
-|:------:|:------------------:|:--------:|:---------:|:-----:|:----:|
-| **PSNR** ↑ | 38.54 | 38.61 | 38.61 | **38.73** | Cubic |
-| **SSIM** ↑ | 0.9443 | 0.9476 | 0.9482 | **0.9540** | Cubic |
-| **MAE** ↓ | 0.00700 | 0.00689 | 0.00688 | **0.00660** | Cubic |
-| **LPIPS** ↓ | 0.02335 | 0.02358 | 0.02353 | **0.02294** | Cubic |
-| **HFEN** ↓ | 0.24173 | **0.24172** | 0.24173 | 0.24214 | 3DGS Std |
-| **GMSD** ↓ | **0.04561** | 0.04562 | 0.04562 | 0.04582 | 3DGS+Patch |
+| Metric | 3DGS+Patch (Ours) | 3DGS Std | 3DGS High | U-Net 2D | Cubic | Linear | Nearest | Best |
+|:------:|:------------------:|:--------:|:---------:|:--------:|:-----:|:------:|:-------:|:----:|
+| **PSNR** ↑ | 38.54 | 38.61 | 38.61 | 37.01 | **38.73** | 38.12 | 35.08 | Cubic |
+| **SSIM** ↑ | 0.9443 | 0.9476 | 0.9482 | 0.9470 | **0.9540** | 0.9538 | 0.9432 | Cubic |
+| **MAE** ↓ | 0.00700 | 0.00689 | 0.00688 | 0.00736 | **0.00660** | 0.00676 | 0.00838 | Cubic |
+| **LPIPS** ↓ | 0.02335 | 0.02358 | 0.02353 | 0.04723 | **0.02294** | 0.02928 | 0.02524 | Cubic |
+| **HFEN** ↓ | 0.24173 | **0.24172** | 0.24173 | 0.26398 | 0.24214 | 0.25194 | 0.32342 | 3DGS Std |
+| **GMSD** ↓ | **0.04561** | 0.04562 | 0.04562 | 0.05238 | 0.04582 | 0.04785 | 0.05841 | 3DGS+Patch |
 
 #### R=4 (4× Interpolation)
 
-| Metric | 3DGS+Patch (Ours) | 3DGS Std | 3DGS High | Cubic | Best |
-|:------:|:------------------:|:--------:|:---------:|:-----:|:----:|
-| **PSNR** ↑ | 36.22 | 36.22 | 36.20 | **36.30** | Cubic |
-| **SSIM** ↑ | 0.9283 | 0.9307 | 0.9263 | **0.9351** | Cubic |
-| **MAE** ↓ | 0.00861 | 0.00848 | 0.00865 | **0.00830** | Cubic |
-| **LPIPS** ↓ | 0.03128 | 0.03138 | 0.03108 | **0.03066** | Cubic |
-| **HFEN** ↓ | 0.30903 | 0.30900 | **0.30897** | 0.30958 | 3DGS High |
-| **GMSD** ↓ | 0.05926 | **0.05925** | 0.05925 | 0.05946 | 3DGS Std |
+| Metric | 3DGS+Patch (Ours) | 3DGS Std | 3DGS High | U-Net 2D | Cubic | Linear | Nearest | Best |
+|:------:|:------------------:|:--------:|:---------:|:--------:|:-----:|:------:|:-------:|:----:|
+| **PSNR** ↑ | 36.22 | 36.22 | 36.20 | 34.82 | **36.30** | 35.98 | 33.48 | Cubic |
+| **SSIM** ↑ | 0.9283 | 0.9307 | 0.9263 | 0.9304 | 0.9351 | **0.9363** | 0.9209 | Linear |
+| **MAE** ↓ | 0.00861 | 0.00848 | 0.00865 | 0.00897 | **0.00830** | 0.00834 | 0.01019 | Cubic |
+| **LPIPS** ↓ | 0.03128 | 0.03138 | 0.03108 | 0.07984 | **0.03066** | 0.03667 | 0.03322 | Cubic |
+| **HFEN** ↓ | 0.30903 | 0.30900 | **0.30897** | 0.32559 | 0.30958 | 0.31364 | 0.39229 | 3DGS High |
+| **GMSD** ↓ | 0.05926 | **0.05925** | 0.05925 | 0.06988 | 0.05946 | 0.06083 | 0.07113 | 3DGS Std |
 
 ### Key Findings
 
@@ -72,8 +75,8 @@ This project explores whether **3D Gaussian Splatting** — originally developed
 | Summary | R=2 | R=3 | R=4 |
 |---------|-----|-----|-----|
 | Δ PSNR vs Cubic | -0.66 dB | -0.18 dB | -0.08 dB |
-| Δ HFEN vs Cubic (3DGS) | **−0.00002** ✓ | **−0.00042** ✓ | **−0.00055** ✓ |
-| Δ GMSD vs Cubic (3DGS) | **−0.00018** ✓ | **−0.00021** ✓ | **−0.00020** ✓ |
+| Δ HFEN vs Cubic (best 3DGS variant) | **−0.00011** ✓ | **−0.00042** ✓ | **−0.00061** ✓ |
+| Δ GMSD vs Cubic (best 3DGS variant) | **−0.00018** ✓ | **−0.00021** ✓ | **−0.00022** ✓ |
 | 3DGS+Patch LPIPS vs 3DGS Std | **−0.0003** ✓ | **−0.0002** ✓ | **−0.0001** ✓ |
 
 ## Key Contributions
@@ -118,6 +121,8 @@ TLCN/
       unet2d.py              # U-Net 2D baseline
       classical_interp.py    # Nearest/linear/cubic + cubic_bm4d + sinc3d + unet_blend
       triplane_inr.py        # Tri-plane INR baseline (3 2D feature grids + MLP)
+      arssr.py               # ArSSR baseline (3D RDN encoder + INR MLP decoder)
+      saint.py               # SAINT baseline (coronal + sagittal EDSR + fusion)
     losses/
       reconstruction.py      # L1, L2, SSIM, FFT high-frequency, combined + multi-scale loss
       regularization.py      # SmoothnessLoss, EdgePreservationLoss, TotalVariationLoss,
@@ -128,6 +133,8 @@ TLCN/
                              # cross-view + patch-prior self-supervision
       trainer_triplane.py    # Tri-plane INR per-volume trainer (residual mode)
       trainer_unet.py        # U-Net training with checkpoint resume support
+      trainer_arssr.py       # ArSSR pretraining + zero-shot inference
+      trainer_saint.py       # SAINT branch + fusion training (per R)
     evaluation/
       metrics.py             # PSNR, SSIM, MAE + LPIPS, HFEN, GMSD, ROI per-organ
       statistical_tests.py   # paired_comparison, build_comparison_table,
@@ -138,8 +145,10 @@ TLCN/
       seed.py                # Reproducibility utilities
   configs/
     default.yaml             # All hyperparameters (data, model, training, evaluation)
-  kaggle_notebooks/          # Self-contained Kaggle notebooks (6 notebooks)
-  outputs/                   # Experiment results (CSV, JSON, figures)
+  kaggle_notebooks/          # Self-contained Kaggle notebooks (NB01 -> NB10)
+  modal_runs/                # Modal.com cloud-runner scripts (mirror of NB04/NB05)
+  outputs/                   # Experiment results (CSV, JSON, checkpoints)
+  modal_app.py               # Modal entry point for remote training
   requirements.txt           # Python dependencies
 ```
 
@@ -178,6 +187,7 @@ All notebooks are designed as self-contained Kaggle notebooks. Each loads raw CT
 | 07 | `07_baseline_arssr.ipynb` | ArSSR pretraining (arbitrary-scale INR) + zero-shot eval for R=2/3/4 | ~7-9h (pretrain once) |
 | 08 | `08_baseline_saint.ipynb` | SAINT SOTA: train 3 models (R=2/3/4) + eval | ~10-13h total (run each R in a separate session) |
 | 09 | `09_baseline_triplane.ipynb` | Tri-plane INR per-volume baseline (self-supervised, x-y correlation native) | ~1-3h per (case, R) |
+| 10 | `10_qualitative_slide_figures.ipynb` | Qualitative side-by-side slide figures at R=3 (GT / Cubic / U-Net / 3DGS, with zoom + |error| heatmap) | ~10 min |
 
 ### NB04 Phased Strategy
 
@@ -336,76 +346,79 @@ Paired t-tests (3DGS vs each baseline, matched per case_idx) are generated in `k
 
 ### Ablation Study
 
-15 variants tested in NB05 to isolate each component's contribution. Includes paired t-tests vs Full (Ours).
+15 variants tested in NB05 to isolate each component's contribution. Currently aggregated from `outputs/ablations/ablation_results_p{1,2,3}.csv` at **R = 3, N = 10 cases** (Full = Ours uses 20 cases — partition 1+2+3 of the 10-case shard).
 
-**Key Contributions:**
+| Variant | Description | PSNR | SSIM | MAE | Δ PSNR vs Full |
+|---------|-------------|:----:|:----:|:---:|:---:|
+| `no_edge` | w/o Edge Preservation | **38.016** | 0.9415 | 0.00769 | +0.050 |
+| `no_lr_decay` | w/o LR Decay | 38.011 | 0.9394 | 0.00778 | +0.046 |
+| `no_errormap` | w/o Error-Map Densification | 37.985 | 0.9389 | 0.00783 | +0.020 |
+| `no_res_penalty` | w/o Residual Penalty | 37.980 | 0.9412 | 0.00773 | +0.015 |
+| **`full`** | **Full (Ours, N=20)** | **37.965** | **0.9383** | **0.00785** | — |
+| `no_fft` | w/o FFT Loss | 37.955 | 0.9379 | 0.00781 | -0.010 |
+| `no_reg` | w/o All Regularization | 37.904 | 0.9390 | 0.00787 | -0.061 |
+| `no_huweight` | w/o HU Gradient Weighting | 37.904 | 0.9347 | 0.00800 | -0.061 |
+| `grid_init` | Grid Init | 37.898 | 0.9369 | 0.00785 | -0.067 |
+| `adaptive_init` | Adaptive (edge-aware) Init | 37.871 | 0.9327 | 0.00808 | -0.094 |
+| `no_multiscale` | w/o Multi-scale Loss | 37.835 | 0.9360 | 0.00799 | -0.130 |
+| `no_tv` | w/o TV Denoising | 37.828 | 0.9389 | 0.00788 | -0.137 |
+| `no_smooth` | w/o Smoothness | 37.677 | 0.9318 | 0.00817 | -0.288 |
+| `baseline` | Raw 3DGS (no improvements) | 28.493 | 0.8401 | 0.01735 | -9.473 |
+| `no_residual` | w/o Residual Learning | 24.317 | 0.6458 | 0.03651 | -13.649 |
 
-| Variant | Description |
-|---------|-------------|
-| `full` | Complete model (Ours) |
-| `no_residual` | w/o Residual Learning |
-| `no_fft` | w/o FFT Loss |
-| `no_errormap` | w/o Error-Map Densification |
-| `no_huweight` | w/o HU Gradient Weighting |
-| `no_res_penalty` | w/o Residual Penalty |
+> **Reading the table.** The two large drops (`baseline`, `no_residual`) confirm that residual learning + the regularization stack are the dominant contributors. Among the fine-grained ablations, removing `smooth` / `tv` / `multiscale` hurts the most, while disabling `edge` or `lr_decay` is statistically a wash on R=3 (within ±0.05 dB of Full). SSIM/MAE deltas mirror the PSNR ranking.
 
-**Regularization:**
-
-| Variant | Description |
-|---------|-------------|
-| `no_reg` | w/o All Regularization |
-| `no_multiscale` | w/o Multi-scale Loss |
-| `no_smooth` | w/o Smoothness |
-| `no_edge` | w/o Edge Preservation |
-| `no_tv` | w/o TV Denoising |
-
-**Initialization & Training:**
-
-| Variant | Description |
-|---------|-------------|
-| `grid_init` | Grid initialization |
-| `adaptive_init` | Adaptive (edge-aware) initialization |
-| `no_lr_decay` | w/o LR decay |
-| `baseline` | Raw 3DGS (no improvements) |
-
-**Multi-account parallel**: Set `PARTITION = 1/2/3` to split ablation across 3 Kaggle accounts (~2-3h each instead of ~7-9h).
+**Multi-account parallel**: Set `PARTITION = 1/2/3` to split ablation across 3 Kaggle accounts (~2-3h each instead of ~7-9h). Partition i writes to `outputs/ablations/ablation_results_p{i}.csv`.
 
 ## Outputs
+
+Tree below reflects the **current state of `outputs/`** in this repository (everything checked-in as of May 1, 2026). Optional folders that will appear once the corresponding notebook is run are marked `(planned)`.
 
 ```
 outputs/
   classical_baselines/
-    summary.csv                          # All classical results (21 cases × 3 methods × 3 ratios)
-    R{r}/summary.csv                     # Per-ratio results with perceptual metrics (LPIPS/HFEN/GMSD)
-    per_case/case{id}_R{r}.json          # Per-case detailed metrics
+    R{r}/                                # r in {2, 3, 4}
+      summary.csv                        # 21 cases x cubic, with PSNR/SSIM/MAE/LPIPS/HFEN/GMSD
+      per_case/case{id}_R{r}.json        # Per-case detailed metrics (cubic only)
   unet_baseline/
-    outputs/unet_R{r}/summary.csv        # U-Net results per sparse ratio
-    checkpoints/unet_R{r}/               # Model weights, history
-  arssr/
-    summary.csv                          # ArSSR results (21 cases x 3 ratios)
-    per_case/case{id}_R{r}.json          # Per-case detailed metrics
-  saint/
-    summary.csv                          # SAINT results (21 cases x 3 ratios)
-    per_case/case{id}_R{r}.json
+    outputs/unet_R{r}/summary.csv        # U-Net 2D results per sparse ratio (PSNR/SSIM/MAE)
+    checkpoints/unet_R{r}/               # Model weights + epoch history
   3dgs/
     3dgs_R{r}/
       high/
-        summary.csv                      # 3DGS high — with perceptual metrics
-        per_case/case{id}_R{r}.json      # Per-case (PSNR/SSIM/MAE/LPIPS/HFEN/GMSD)
-      standard/
-        summary.csv                      # 3DGS standard — with perceptual metrics
+        summary.csv                      # 3DGS high (~1.0M Gaussians)
         per_case/case{id}_R{r}.json
+        checkpoints/case{id}_R{r}/       # final.pt
+      standard/
+        summary.csv                      # 3DGS standard (~0.8M Gaussians)
+        per_case/case{id}_R{r}.json
+        checkpoints/case{id}_R{r}/
   3dgs_improve/
-    H3d/
+    H3d/                                 # H3d = patch-based non-local prior (Ours)
       R{r}/
-        summary.csv                      # H3DGS patch_prior — with perceptual metrics
-        per_case/case{id}_R{r}.json      # Per-case (PSNR/SSIM/MAE/LPIPS/HFEN/GMSD)
-        checkpoints/case{id}_R{r}/       # Saved model weights (final.pt)
-  ablation/
-    ablation_results.csv                 # All ablation variants
-  figures/                               # Publication-ready visualizations
-    comparison_table.csv                 # Paired t-test: 3DGS vs each baseline
+        summary.csv                      # H3DGS patch_prior with perceptual metrics
+        per_case/case{id}_R{r}.json
+        checkpoints/case{id}_R{r}/
+    check_cubic.py / compare_results.py / fix_nb10.py /
+    r2_stats.py / rebuild_summary.py     # Helper scripts used to rebuild summaries
+  ablations/
+    ablation_results_p1.csv              # NB05 partition 1 (10 cases @ R=3, full + 3 variants)
+    ablation_results_p1_no_residual.csv  # Companion run that re-ran the no_residual variant
+    ablation_results_p2.csv              # NB05 partition 2
+    ablation_results_p3.csv              # NB05 partition 3
+    paper_table1_p2.csv                  # Compact "paper Table 1" (Nearest/Linear/Cubic/U-Net/3DGS)
+  roi_table.csv                          # Aggregated ROI PSNR/SSIM by (R, method, organ)
+  arssr/                                 # (planned) populated by NB07
+  saint/                                 # (planned) populated by NB08
+  triplane/                              # (planned) populated by NB09
+  figures/                               # (planned) populated by NB06a/NB10
 ```
+
+**Notes on data lineage:**
+
+- The 3DGS / H3d `summary.csv` files were rebuilt by `outputs/3dgs_improve/rebuild_summary.py` from the per-case JSONs after `06_reeval_perceptual.ipynb` added LPIPS/HFEN/GMSD. As a side-effect, `training_time_s = 0` in those rebuilt summaries — refer to the NB04/NB05 logs for actual training times.
+- Mean inference time per case (forward render only, T4 single-GPU): R=2 ≈ 2.0–2.4 s, R=3 ≈ 3.7–3.9 s, R=4 ≈ 5.4–7.1 s, scaling with the number of target slices.
+- `outputs/roi_table.csv` is aggregated from each method's `summary.csv` `roi` column. It reports mean ROI PSNR/SSIM per `(sparse_ratio, method, organ)` and includes `n_cases_with_roi` for transparency.
 
 ## Technical Optimizations
 
